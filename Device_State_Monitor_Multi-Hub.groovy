@@ -38,10 +38,98 @@ FEATURES:
     * Graceful error handling if a remote hub is offline or unreachable.
     * Only switch-capable devices appear in ON/OFF/Unknown selection lists.
     * Remote hub action dropdowns leave their section open after action.
+    * Each Device Selection section shows one reminder + a direct "Open
+      Maker API" link button so newly added hub devices aren't missed: a
+      device must be exposed in Maker API on its hub BEFORE it can appear
+      in any picker here, even after Load/Reload.
+
+CHANGES IN 1.54:
+    * All Maker API calls now go through a hardened fetchJson() helper that
+      retrieves the response as raw text and parses JSON manually, and reports
+      the HTTP status plus the start of any non-JSON response body instead of
+      a cryptic "Lexing failed ... reading '<'" JSON lexer error.
+
+CHANGES IN 1.55:
+    * fetchJson() now splits the ?access_token=... query string out of the URI
+      and passes it via the query: map. Works around the platform 2.5.1.x
+      (Apache HttpClient 5.6.1) regression where a query string embedded in
+      the uri is silently dropped on the wire, causing remote Maker API calls
+      to arrive unauthenticated. Compatible with 2.5.0.x and earlier as well.
+
+CHANGES IN 1.56:
+    * NEW: Contact Sensor table. Each hub has its own contact sensor selector
+      (Hub #1 via capability picker; Hubs #2/#3 via Maker API device list —
+      run Load / Reload Device List once after upgrading to populate them).
+      By default the table lists only sensors currently OPEN ("N open of M
+      monitored"); a display option switches it to show every selected sensor.
+    * FIX: HSM Alert now clears when a custom-rule alert is cancelled. HSM
+      cancels rule alerts with hsmAlert value "cancelRuleAlerts", not "cancel";
+      the old handler only recognized "cancel", so a CUSTOM RULE alert stayed
+      on screen forever after HSM itself had cleared it. Both cancel values
+      are now honored, transient "arming*" notices are no longer latched as
+      alerts, and rule alerts now display the rule name and start time.
+    * NEW: "Clear HSM Alert Display" button appears next to Refresh whenever
+      an alert is latched, as a manual escape hatch if a cancel event is ever
+      missed (e.g. hub reboot mid-alert, or an alert stuck from v1.55).
+    * FIX: HSM Status label. hsmStatus "disarmed" only means INTRUSION is
+      disarmed — smoke/water/custom monitoring stays armed until All
+      Monitoring is disarmed (hsmStatus "allDisarmed"). The badge now reads
+      "Intrusion Disarmed" with a note that smoke/water/custom rules remain
+      armed, matching the hub UI's "Armed Smoke/Water" wording.
+
+CHANGES IN 1.57:
+    * NEW: HSM alert verification on every refresh. HSM reports alerts to
+      other apps ONLY via hsmAlert location events — there is no query API —
+      so a single missed event (code update race, app reinstall, hub reboot
+      mid-alert) left the badge permanently wrong. The app now also polls the
+      hub itself at refresh time: if the HSM app ID is configured (the number
+      in HSM's URL, e.g. /installedapp/configure/2), it reads the HSM app
+      page directly and extracts the live alert text (e.g. "Custom Rule
+      Alert: Door Locks unlocked"); otherwise it scans the local Apps list
+      for the red "ALERT!" suffix HSM adds to its own app label. Either way,
+      the badge is reconciled with reality on every Refresh Table click —
+      missed alert events are detected and displayed, and stale alerts are
+      auto-cleared. Requires Hub Login Security to be OFF on Hub #1 (or the
+      badge shows a note that verification is unavailable and falls back to
+      event-only behavior). Verification can be disabled in Sort & Display
+      Options.
+
+CHANGES IN 1.58:
+    * NEW: HSM status and alert display for Hubs #2 and #3 (off by default;
+      enable per hub in Sort & Display Options).
+      - STATUS comes from each hub's Maker API HSM endpoint
+        (/apps/api/<id>/hsm) using the credentials already configured for
+        that hub. Requires the HSM toggle to be enabled inside that hub's
+        Maker API app ("Allow control of HSM"); until it is, the badge shows
+        Unavailable with a hint.
+      - ALERTS use the same page-verification technique introduced in 1.57,
+        pointed at the remote hub's IP: with the remote HSM app ID
+        configured, the live alert text is read from that hub's HSM app
+        page; otherwise the remote Apps list is scanned for the "ALERT!"
+        label suffix. Requires Hub Login Security OFF on the remote hub.
+      - Remote hubs have no event path (location events do not cross hubs),
+        so remote alert state is poll-only and updates on each refresh —
+        which is when the report updates anyway.
+    * When any remote HSM badge is enabled, all HSM lines are labeled with
+      their hub's friendly name to keep them distinguishable.
+    * Internal: pollHsmAlertFromHub() generalized to pollHsmAlertFromHost()
+      so Hub #1 and remote hubs share the same verification code path.
+
+CHANGES IN 1.59:
+    * FIX: The "Clear HSM Alert Display" button lagged one refresh behind the
+      alert badge. The button's visibility check ran BEFORE the report was
+      generated, but the report generation is where the 1.57 verification
+      poll runs — so an alert latched (or auto-cleared) by the poll itself
+      updated the badge on that refresh while the button only caught up on
+      the next one. The report is now generated first and the button check
+      evaluated afterward, so the button and badge always agree within the
+      same refresh. (Note: as with all Hubitat app pages, the page itself
+      only updates on a render — clicking Refresh Table or reopening the
+      app — never spontaneously while it sits open.)
 */
 
 definition(
-    name:         "Device State Monitor Multi-Hub 1.52",
+    name:         "Device State Monitor Multi-Hub 1.59",
     namespace:    "John Land",
     author:       "John Land via Claude AI and ChatGPT",
     description:  "Reports ON/OFF/unknown switch states and health/activity status across up to three hubs",
@@ -67,7 +155,15 @@ def mainPage() {
         // ── Refresh + Report (TOP) ────────────────────────────────────────────
         section(title: "") {
             input "refresh", "button", title: "Refresh Table"
-            paragraph handler()
+            // Generate the report BEFORE deciding whether to show the Clear
+            // button: report generation runs the HSM verification poll, which
+            // can latch a newly-detected alert or auto-clear a stale one.
+            // Evaluating the button first left it one refresh behind (1.58).
+            def reportHtml = handler()
+            if (state.hsmActiveAlert) {
+                input "btnClearHsmAlert", "button", title: "Clear HSM Alert Display"
+            }
+            paragraph reportHtml
         }
 
         // ── Second Refresh button (bottom of report, above config sections) ──
@@ -79,9 +175,10 @@ def mainPage() {
         def hub1LabelVal       = settings["hub1Label"] ?: (location.name ?: "Hub 1")
         def h1OnCount          = (devsOn   ?: []).findAll { !it.isDisabled() }.size()
         def h1OffCount         = (devsOff  ?: []).findAll { !it.isDisabled() }.size()
-        def h1LockCount        = (devsLock ?: []).findAll { !it.isDisabled() }.size()
+        def h1LockCount        = (devsLock    ?: []).findAll { !it.isDisabled() }.size()
+        def h1ContactCount     = (devsContact ?: []).findAll { !it.isDisabled() }.size()
         def hub1Title          = "Device Selection for Hub #1 – ${hub1LabelVal}"
-        if (showSectionDetails) hub1Title += buildSelSummary(h1OnCount, h1OffCount, (hub1HealthDevs ?: []).size(), h1LockCount)
+        if (showSectionDetails) hub1Title += buildSelSummary(h1OnCount, h1OffCount, (hub1HealthDevs ?: []).size(), h1LockCount, h1ContactCount)
 
         def hub1HealthActionVal  = settings["hub1HealthAction"]
         def hub1HealthActionOpen = (hub1HealthActionVal && hub1HealthActionVal != "none")
@@ -133,6 +230,12 @@ def mainPage() {
                 title: "Select lock-monitored devices (${h1LockSelCount} selected)",
                 submitOnChange: true, multiple: true, required: false
 
+            paragraph("<hr><b>Devices to monitor for contact state</b> <small>(sensors currently OPEN are flagged)</small>")
+            def h1ContactSelCount = (devsContact ?: []).size()
+            input "devsContact", "capability.contactSensor",
+                title: "Select contact-monitored devices (${h1ContactSelCount} selected)",
+                submitOnChange: true, multiple: true, required: false
+
             // ── Hub #1 Health / Activity selector ────────────────────────────
             paragraph("<hr>")
             // Collapsible Maker API block (toggle commands AND health device loading share same credentials)
@@ -158,6 +261,7 @@ def mainPage() {
 
             def hub1ApiReady = (settings["hub1AppId"] && settings["hub1Token"])
             if (hub1ApiReady) {
+                makerApiReminder(hub1LabelVal, location.hubs[0].localIP, settings["hub1AppId"])
                 // Load / Select All / Clear All controls (Maker API used only for the device list)
                 def h1HealthStatus = state["hub1AllDevicesStatus"]
                 if (h1HealthStatus) {
@@ -191,11 +295,13 @@ def mainPage() {
         def h2OnList     = normalizeSelectionList(settings["hub2SelectedOnDevices"])
         def h2OffList    = normalizeSelectionList(settings["hub2SelectedOffDevices"])
         def h2HealthList = normalizeSelectionList(settings["hub2SelectedHealthDevices"])
-        def h2LockList   = normalizeSelectionList(settings["hub2SelectedLockDevices"])
+        def h2LockList    = normalizeSelectionList(settings["hub2SelectedLockDevices"])
+        def h2ContactList = normalizeSelectionList(settings["hub2SelectedContactDevices"])
         if (hub2ActionOpen) {
-            def stored    = state["hub2Devices"]    ?: []
-            def storedAll = state["hub2AllDevices"] ?: []
-            def storedLck = state["hub2LockDevices"] ?: []
+            def stored    = state["hub2Devices"]        ?: []
+            def storedAll = state["hub2AllDevices"]     ?: []
+            def storedLck = state["hub2LockDevices"]    ?: []
+            def storedCt  = state["hub2ContactDevices"] ?: []
             switch (hub2ActionVal) {
                 case "selAllOn":      h2OnList     = stored.collect    { it.id.toString() }; break
                 case "unselAllOn":    h2OnList     = []; break
@@ -205,16 +311,19 @@ def mainPage() {
                 case "unselAllHealth":h2HealthList = []; break
                 case "selAllLock":    h2LockList   = storedLck.collect { it.id.toString() }; break
                 case "unselAllLock":  h2LockList   = []; break
+                case "selAllContact": h2ContactList = storedCt.collect { it.id.toString() }; break
+                case "unselAllContact": h2ContactList = []; break
             }
         }
         def hub2Title = "Device Selection for Hub #2 – ${hub2LabelVal}"
-        if (showSectionDetails && hub2Enabled) hub2Title += buildSelSummary(h2OnList.size(), h2OffList.size(), h2HealthList.size(), h2LockList.size())
+        if (showSectionDetails && hub2Enabled) hub2Title += buildSelSummary(h2OnList.size(), h2OffList.size(), h2HealthList.size(), h2LockList.size(), h2ContactList.size())
 
         section(hideable: true, hidden: !hub2ActionOpen, title: hub2Title) {
             if (hub2ActionOpen) {
-                def hub2Stored    = state["hub2Devices"]    ?: []
-                def hub2StoredAll = state["hub2AllDevices"] ?: []
-                def hub2StoredLck = state["hub2LockDevices"] ?: []
+                def hub2Stored    = state["hub2Devices"]        ?: []
+                def hub2StoredAll = state["hub2AllDevices"]     ?: []
+                def hub2StoredLck = state["hub2LockDevices"]    ?: []
+                def hub2StoredCt  = state["hub2ContactDevices"] ?: []
                 switch (hub2ActionVal) {
                     case "load":
                         loadRemoteDeviceList(2, settings["hub2Ip"], settings["hub2AppId"], settings["hub2Token"]); break
@@ -233,7 +342,11 @@ def mainPage() {
                     case "selAllLock":
                         app.updateSetting("hub2SelectedLockDevices",   [value: hub2StoredLck.collect { it.id.toString() }, type: "enum"]); break
                     case "unselAllLock":
-                        app.updateSetting("hub2SelectedLockDevices",   [value: [], type: "enum"]); break
+                        app.updateSetting("hub2SelectedLockDevices",    [value: [], type: "enum"]); break
+                    case "selAllContact":
+                        app.updateSetting("hub2SelectedContactDevices", [value: hub2StoredCt.collect { it.id.toString() }, type: "enum"]); break
+                    case "unselAllContact":
+                        app.updateSetting("hub2SelectedContactDevices", [value: [], type: "enum"]); break
                 }
                 app.updateSetting("hub2Action", [value: "none", type: "enum"])
             }
@@ -260,15 +373,18 @@ def mainPage() {
                     def c = hub2Status.startsWith("OK") ? "green" : "red"
                     paragraph("<small><i>Last load: <span style='color:${c};font-weight:bold;'>${hub2Status}</span></i></small>")
                 }
+                makerApiReminder(hub2LabelVal, settings["hub2Ip"], settings["hub2AppId"])
                 input "hub2Action", "enum", title: "Hub #2 Actions", defaultValue: "none",
                     options: ["none": "Choose action…", "load": "⟳ Load / Reload Device List from Hub #2",
                               "selAllOn": "✓ Select All ON-monitored devices",     "unselAllOn":    "✗ Clear ON-monitored devices",
                               "selAllOff": "✓ Select All OFF-monitored devices",   "unselAllOff":   "✗ Clear OFF-monitored devices",
                               "selAllLock": "✓ Select All lock-monitored devices", "unselAllLock":  "✗ Clear lock-monitored devices",
+                              "selAllContact": "✓ Select All contact-monitored devices", "unselAllContact": "✗ Clear contact-monitored devices",
                               "selAllHealth": "✓ Select All health-monitored devices", "unselAllHealth": "✗ Clear health-monitored devices"],
                     required: false, submitOnChange: true
                 renderRemoteDeviceSelectors(2, state["hub2Devices"], h2OnList, h2OffList)
                 renderRemoteLockDeviceSelector(2, state["hub2LockDevices"], h2LockList)
+                renderRemoteContactDeviceSelector(2, state["hub2ContactDevices"], h2ContactList)
                 renderRemoteHealthDeviceSelector(2, state["hub2AllDevices"], h2HealthList)
                 paragraph("<small><i><b>Disabled devices:</b> Hubitat's Maker API does not expose disabled state " +
                           "reliably, so disabled devices on remote hubs cannot be filtered automatically. " +
@@ -290,11 +406,13 @@ def mainPage() {
         def h3OnList     = normalizeSelectionList(settings["hub3SelectedOnDevices"])
         def h3OffList    = normalizeSelectionList(settings["hub3SelectedOffDevices"])
         def h3HealthList = normalizeSelectionList(settings["hub3SelectedHealthDevices"])
-        def h3LockList   = normalizeSelectionList(settings["hub3SelectedLockDevices"])
+        def h3LockList    = normalizeSelectionList(settings["hub3SelectedLockDevices"])
+        def h3ContactList = normalizeSelectionList(settings["hub3SelectedContactDevices"])
         if (hub3ActionOpen) {
-            def stored    = state["hub3Devices"]    ?: []
-            def storedAll = state["hub3AllDevices"] ?: []
-            def storedLck = state["hub3LockDevices"] ?: []
+            def stored    = state["hub3Devices"]        ?: []
+            def storedAll = state["hub3AllDevices"]     ?: []
+            def storedLck = state["hub3LockDevices"]    ?: []
+            def storedCt  = state["hub3ContactDevices"] ?: []
             switch (hub3ActionVal) {
                 case "selAllOn":      h3OnList     = stored.collect    { it.id.toString() }; break
                 case "unselAllOn":    h3OnList     = []; break
@@ -304,16 +422,19 @@ def mainPage() {
                 case "unselAllHealth":h3HealthList = []; break
                 case "selAllLock":    h3LockList   = storedLck.collect { it.id.toString() }; break
                 case "unselAllLock":  h3LockList   = []; break
+                case "selAllContact": h3ContactList = storedCt.collect { it.id.toString() }; break
+                case "unselAllContact": h3ContactList = []; break
             }
         }
         def hub3Title = "Device Selection for Hub #3 – ${hub3LabelVal}"
-        if (showSectionDetails && hub3Enabled) hub3Title += buildSelSummary(h3OnList.size(), h3OffList.size(), h3HealthList.size(), h3LockList.size())
+        if (showSectionDetails && hub3Enabled) hub3Title += buildSelSummary(h3OnList.size(), h3OffList.size(), h3HealthList.size(), h3LockList.size(), h3ContactList.size())
 
         section(hideable: true, hidden: !hub3ActionOpen, title: hub3Title) {
             if (hub3ActionOpen) {
-                def hub3Stored    = state["hub3Devices"]    ?: []
-                def hub3StoredAll = state["hub3AllDevices"] ?: []
-                def hub3StoredLck = state["hub3LockDevices"] ?: []
+                def hub3Stored    = state["hub3Devices"]        ?: []
+                def hub3StoredAll = state["hub3AllDevices"]     ?: []
+                def hub3StoredLck = state["hub3LockDevices"]    ?: []
+                def hub3StoredCt  = state["hub3ContactDevices"] ?: []
                 switch (hub3ActionVal) {
                     case "load":
                         loadRemoteDeviceList(3, settings["hub3Ip"], settings["hub3AppId"], settings["hub3Token"]); break
@@ -332,7 +453,11 @@ def mainPage() {
                     case "selAllLock":
                         app.updateSetting("hub3SelectedLockDevices",   [value: hub3StoredLck.collect { it.id.toString() }, type: "enum"]); break
                     case "unselAllLock":
-                        app.updateSetting("hub3SelectedLockDevices",   [value: [], type: "enum"]); break
+                        app.updateSetting("hub3SelectedLockDevices",    [value: [], type: "enum"]); break
+                    case "selAllContact":
+                        app.updateSetting("hub3SelectedContactDevices", [value: hub3StoredCt.collect { it.id.toString() }, type: "enum"]); break
+                    case "unselAllContact":
+                        app.updateSetting("hub3SelectedContactDevices", [value: [], type: "enum"]); break
                 }
                 app.updateSetting("hub3Action", [value: "none", type: "enum"])
             }
@@ -359,15 +484,18 @@ def mainPage() {
                     def c = hub3Status.startsWith("OK") ? "green" : "red"
                     paragraph("<small><i>Last load: <span style='color:${c};font-weight:bold;'>${hub3Status}</span></i></small>")
                 }
+                makerApiReminder(hub3LabelVal, settings["hub3Ip"], settings["hub3AppId"])
                 input "hub3Action", "enum", title: "Hub #3 Actions", defaultValue: "none",
                     options: ["none": "Choose action…", "load": "⟳ Load / Reload Device List from Hub #3",
                               "selAllOn": "✓ Select All ON-monitored devices",     "unselAllOn":    "✗ Clear ON-monitored devices",
                               "selAllOff": "✓ Select All OFF-monitored devices",   "unselAllOff":   "✗ Clear OFF-monitored devices",
                               "selAllLock": "✓ Select All lock-monitored devices", "unselAllLock":  "✗ Clear lock-monitored devices",
+                              "selAllContact": "✓ Select All contact-monitored devices", "unselAllContact": "✗ Clear contact-monitored devices",
                               "selAllHealth": "✓ Select All health-monitored devices", "unselAllHealth": "✗ Clear health-monitored devices"],
                     required: false, submitOnChange: true
                 renderRemoteDeviceSelectors(3, state["hub3Devices"], h3OnList, h3OffList)
                 renderRemoteLockDeviceSelector(3, state["hub3LockDevices"], h3LockList)
+                renderRemoteContactDeviceSelector(3, state["hub3ContactDevices"], h3ContactList)
                 renderRemoteHealthDeviceSelector(3, state["hub3AllDevices"], h3HealthList)
                 paragraph("<small><i><b>Disabled devices:</b> Hubitat's Maker API does not expose disabled state " +
                           "reliably, so disabled devices on remote hubs cannot be filtered automatically. " +
@@ -421,6 +549,18 @@ def mainPage() {
                 input "sortOrderLock", "enum", title: "Order",   options: ["asc": "Ascending", "desc": "Descending"],                                             defaultValue: "asc",          submitOnChange: true
             }
 
+            paragraph("<hr><b>Contact Sensor Table</b>")
+            input "showContactTable", "bool",
+                title: "Show Contact Sensor table?",
+                defaultValue: true, submitOnChange: true
+            if (settings["showContactTable"] != false) {
+                input "contactOpenOnly", "bool",
+                    title: "Show only sensors currently OPEN? (off = show all selected sensors with their state)",
+                    defaultValue: true, submitOnChange: true
+                input "sortByContact",    "enum", title: "Sort by", options: ["displayName": "Device Name", "room": "Room", "hub": "Hub", "contactVal": "Contact State", "battery": "Battery %"], defaultValue: "displayName", submitOnChange: true
+                input "sortOrderContact", "enum", title: "Order",   options: ["asc": "Ascending", "desc": "Descending"],                                                     defaultValue: "asc",          submitOnChange: true
+            }
+
             paragraph("<hr><b>Health / Activity Monitor Table</b>")
             input "showHealthTable", "bool",
                 title: "Show Health/Activity Monitor table?",
@@ -442,7 +582,30 @@ def mainPage() {
             input "excludeVirtual",    "bool", title: "Exclude virtual devices from all reports (including Health/Activity table)?", defaultValue: false
             input "excludeSystemRoom", "bool", title: "Exclude devices in the \"System\" room from all reports?", defaultValue: false
             paragraph("<hr>")
-            input "showHsmStatus",     "bool", title: "Show Hubitat Safety Monitor (HSM) status above the tables?", defaultValue: true
+            input "showHsmStatus",     "bool", title: "Show Hubitat Safety Monitor (HSM) status above the tables?", defaultValue: true, submitOnChange: true
+            if (settings["showHsmStatus"] != false) {
+                input "hsmVerifyAlert", "bool",
+                    title: "Verify the HSM alert state against the hub on every refresh? (recommended — catches missed hsmAlert events and auto-clears stale alerts; requires Hub Login Security OFF on Hub #1)",
+                    defaultValue: true, submitOnChange: true
+                if (settings["hsmVerifyAlert"] != false) {
+                    input "hsmAppId", "number",
+                        title: "HSM app ID (optional but recommended — the number in HSM's URL, e.g. /installedapp/configure/<b>2</b>. When set, the live alert text is read straight from the HSM app page.)",
+                        required: false, submitOnChange: false
+                }
+                [2, 3].each { rn ->
+                    if (settings["hub${rn}Enabled"]) {
+                        def rLabel = settings["hub${rn}Label"] ?: "Hub ${rn}"
+                        input "showHsmStatusHub${rn}", "bool",
+                            title: "Also show HSM status for Hub #${rn} (${rLabel})? Requires the <b>HSM</b> toggle enabled inside that hub's Maker API app. Adds 1–2 HTTP calls per refresh.",
+                            defaultValue: false, submitOnChange: true
+                        if (settings["showHsmStatusHub${rn}"]) {
+                            input "hub${rn}HsmAppId", "number",
+                                title: "Hub #${rn} HSM app ID (optional — the number in HSM's URL on that hub; enables live alert text. Alert checking requires Hub Login Security OFF on Hub #${rn}.)",
+                                required: false, submitOnChange: false
+                        }
+                    }
+                }
+            }
             paragraph("<hr>")
             input "showSectionDetails","bool", title: "Show extra details in section headers?",    defaultValue: true
 
@@ -474,14 +637,25 @@ def mainPage() {
                 "The <b>Refresh Table</b> button and all four report tables appear at the top of the page. " +
                 "If HSM is installed, its current intrusion-arm status appears above the tables as a colour-coded badge. " +
                 "Active HSM alerts (intrusion, smoke, water, custom rules) are shown separately as a blinking red line — " +
-                "the app subscribes to <i>hsmAlert</i> events and stores the active alert in app state, clearing it automatically when HSM cancels the alert. " +
+                "the app subscribes to <i>hsmAlert</i> events and stores the active alert in app state, clearing it automatically when HSM cancels the alert " +
+                "(both the <i>cancel</i> and <i>cancelRuleAlerts</i> cancellation values are honored — custom-rule alerts use the latter). " +
+                "If a cancel event is ever missed (e.g. hub reboot mid-alert), a <b>Clear HSM Alert Display</b> button appears next to Refresh Table. " +
+                "In addition, when <b>Verify the HSM alert state</b> is enabled (Sort &amp; Display Options, on by default), every refresh " +
+                "cross-checks the badge against the hub itself: with the HSM app ID configured, the live alert text is read straight from the HSM app page " +
+                "(e.g. <i>Custom Rule Alert: Door Locks unlocked</i>); without it, the hub's Apps list is scanned for the red ALERT! suffix HSM adds to its label. " +
+                "Missed alerts are detected and displayed, and stale alerts are auto-cleared. This requires Hub Login Security to be OFF on Hub #1 — " +
+                "if the pages can't be read, a note appears and the badge falls back to events only. " +
+                "HSM on <b>Hubs #2 and #3</b> can also be displayed (off by default — enable per hub in Sort &amp; Display Options): " +
+                "the arm status is fetched from that hub's Maker API <i>/hsm</i> endpoint (enable the HSM toggle inside that hub's Maker API app), " +
+                "and alerts are checked by reading that hub's HSM / Apps pages, like Hub #1. Remote alerts are poll-only — location events don't cross hubs — " +
+                "so they appear and clear on each refresh. When any remote HSM badge is on, every HSM line is labeled with its hub's name. " +
                 "Note: HSM's <i>hsmStatus</i> only reflects intrusion arming (Away / Home / Night / Disarmed). " +
-                "Smoke and water monitoring rules arm separately via <i>hsmRules</i> and do not change <i>hsmStatus</i>, " +
-                "so the badge may read Disarmed even when smoke/water rules are active — this is a Hubitat platform limitation. " +
+                "Smoke, water and custom monitoring rules stay armed even when intrusion is disarmed (until All Monitoring is disarmed), " +
+                "so the badge shows <b>Intrusion Disarmed</b> with a note that smoke/water/custom monitoring remains armed — matching the hub's own \"Armed Smoke/Water\" wording. " +
                 "Configuration sections (Hub #1, Hub #2, Hub #3, Sort &amp; Display Options, and these Notes) " +
                 "are collapsed below and stay out of the way after initial setup." +
 
-                "<hr><b>The Four Tables</b>" +
+                "<hr><b>The Report Tables</b>" +
                 "<ul>" +
                 "<li><b>ON Devices</b> — monitored devices currently reporting switch state <b>on</b>.</li>" +
                 "<li><b>OFF Devices</b> — monitored devices currently reporting switch state <b>off</b>.</li>" +
@@ -490,6 +664,11 @@ def mainPage() {
                 "Hub #1 uses a capability picker; Hubs #2 and #3 use the lock device selector populated by Load / Reload. " +
                 "Locked is shown in green, unlocked in red. Battery % uses the same colour coding as the Health table " +
                 "(green ≥ 40%, orange 20–39%, red &lt; 20%; shown as <i>n/a</i> if the device has no battery attribute).</li>" +
+                "<li><b>Contact Sensors</b> — selected contact sensors. By default only sensors currently <b>open</b> are listed " +
+                "(shown in red), with the heading reporting \"N open of M monitored\"; a Sort &amp; Display option switches to showing " +
+                "every selected sensor with its state (open in red, closed in green). Hub #1 uses a capability picker; " +
+                "Hubs #2 and #3 use a contact sensor selector populated by Load / Reload " +
+                "(run <b>Load / Reload Device List</b> once after upgrading to 1.56 to populate it).</li>" +
                 "<li><b>Health / Activity Monitor</b> — any health-monitored device that is OFFLINE, INACTIVE, NOT PRESENT, " +
                 "or whose last activity exceeds the configured threshold. Columns: Device Name, Room, Hub, HE Status, " +
                 "Issue, HE Status, Health Status, Last Activity, Battery %, Last Battery.</li>" +
@@ -524,7 +703,7 @@ def mainPage() {
                 "<b>Exclude virtual devices</b> — omits devices whose driver name contains \"virtual\" or whose name starts with \"VD \" from all tables.<br>" +
                 "<b>Exclude System room</b> — omits devices in the Hubitat room named \"System\" from all tables.<br>" +
                 "<b>Hide Columns</b> — eight toggle buttons control column visibility. " +
-                "<b>Room</b> and <b>Hub</b> apply to all four tables. " +
+                "<b>Room</b> and <b>Hub</b> apply to all tables. " +
                 "The remaining six apply to the Health / Activity table only: " +
                 "<b>Issue</b>, <b>HE Status</b>, <b>Health Status</b>, <b>Last Activity</b>, <b>Battery %</b>, <b>Last Battery</b>. " +
                 "Buttons appear in the same left-to-right order as the columns they control. " +
@@ -639,13 +818,44 @@ private List normalizeSelectionList(def raw) {
     return raw ? [raw.toString()] : []
 }
 
-private String buildSelSummary(int onCount, int offCount, int healthCount = 0, int lockCount = 0) {
-    if (onCount == 0 && offCount == 0 && healthCount == 0 && lockCount == 0) return " — No devices selected"
+// ─────────────────────────────────────────────────────────────────────────────
+// MAKER API "DON'T FORGET NEW DEVICES" REMINDER
+// A device that exists on a hub but was never checked/exposed in that hub's
+// Maker API app will NOT show up here, even after Load/Reload — this app can
+// only see what Maker API reports. This helper renders a visible reminder
+// plus a clickable button that opens the Maker API config page on the target
+// hub directly, so adding a newly-installed device is a one-click trip.
+// ─────────────────────────────────────────────────────────────────────────────
+
+private String makerApiOpenUrl(String ip, String appId) {
+    if (!ip || !appId) return null
+    return "http://${ip}/installedapp/configure/${appId}"
+}
+
+private void makerApiReminder(String hubLabel, String ip, String appId) {
+    def url = makerApiOpenUrl(ip, appId)
+    paragraph("<div style='border:1px solid #e0a800;background:#fff8e1;border-radius:6px;padding:8px 10px;margin:6px 0;'>" +
+              "<b>⚠️ Before you Load/Reload:</b> a newly added device on <b>${hubLabel}</b> will not appear " +
+              "in any picker below until it has been checked/exposed in the <b>Maker API</b> app on that hub. " +
+              "Reloading here only re-reads what Maker API already exposes — it cannot discover devices Maker API doesn't know about." +
+              (url
+                ? " <a href='${url}' target='_blank' " +
+                  "style='display:inline-block;margin-top:6px;padding:4px 10px;" +
+                  "background-color:#2a6fdb !important;color:#ffffff !important;border-radius:4px;" +
+                  "text-decoration:none !important;font-weight:bold;border:1px solid #1a4f9e;'>" +
+                  "🔧 <span style='color:#ffffff !important;'>Open Maker API on ${hubLabel}</span></a>"
+                : " <i>(Enter the IP, App ID, and Token below to enable a direct link to Maker API on ${hubLabel}.)</i>") +
+              "</div>")
+}
+
+private String buildSelSummary(int onCount, int offCount, int healthCount = 0, int lockCount = 0, int contactCount = 0) {
+    if (onCount == 0 && offCount == 0 && healthCount == 0 && lockCount == 0 && contactCount == 0) return " — No devices selected"
     def parts = []
-    if (onCount     > 0) parts << "${onCount} ON"
-    if (offCount    > 0) parts << "${offCount} OFF"
-    if (lockCount   > 0) parts << "${lockCount} Lock"
-    if (healthCount > 0) parts << "${healthCount} Health"
+    if (onCount      > 0) parts << "${onCount} ON"
+    if (offCount     > 0) parts << "${offCount} OFF"
+    if (lockCount    > 0) parts << "${lockCount} Lock"
+    if (contactCount > 0) parts << "${contactCount} Contact"
+    if (healthCount  > 0) parts << "${healthCount} Health"
     return " — " + parts.join(" / ") + " monitored"
 }
 
@@ -688,6 +898,41 @@ private Map buildRemoteLockDeviceOptions(int hubNum) {
     return filtered.sort { it.name }.collectEntries { dev ->
         def label = dev.name + (dev.room ? " (${dev.room})" : "")
         ["${dev.id}": label]
+    }
+}
+
+private Map buildRemoteContactDeviceOptions(int hubNum) {
+    def stored     = state["hub${hubNum}ContactDevices"]
+    if (stored == null) return null
+    def filterText = settings["hub${hubNum}Filter"]?.toLowerCase()?.trim()
+    def filtered   = filterText
+        ? stored.findAll { dev -> dev.name?.toLowerCase()?.contains(filterText) || dev.room?.toLowerCase()?.contains(filterText) }
+        : stored
+    if (!filtered) return [:]
+    return filtered.sort { it.name }.collectEntries { dev ->
+        def label = dev.name + (dev.room ? " (${dev.room})" : "")
+        ["${dev.id}": label]
+    }
+}
+
+private void renderRemoteContactDeviceSelector(int hubNum, def contactDevices, List contactSel) {
+    if (contactDevices == null) {
+        paragraph("<i><b>Contact sensor monitoring:</b> Device list not yet loaded (or loaded by an app version " +
+                  "before 1.56). Choose <b>Load / Reload Device List</b> above to populate the contact sensor selector.</i>")
+        return
+    }
+    def total = contactDevices.size()
+    paragraph("<hr><b>Devices to monitor for contact state — Hub #${hubNum}</b> &nbsp;" +
+              "<small>(${contactSel.size()} selected of ${total} contact sensor${total == 1 ? '' : 's'} available)</small>")
+    def opts = buildRemoteContactDeviceOptions(hubNum)
+    def filterNote = settings["hub${hubNum}Filter"] ? " — filtered" : ""
+    if (opts != null && opts.size() > 0) {
+        input "hub${hubNum}SelectedContactDevices", "enum",
+            title: "Contact-monitored devices (${opts.size()} available${filterNote})",
+            options: opts, multiple: true, required: false, submitOnChange: true
+    } else if (opts != null) {
+        paragraph("<span style='color:red;'>No contact sensor devices found on Hub #${hubNum}. " +
+                  "Ensure contact sensors are exposed in the Maker API app.</span>")
     }
 }
 
@@ -735,18 +980,39 @@ void initialize() {
 }
 
 def hsmAlertHandler(evt) {
-    if (evt.value == "cancel") {
-        state.remove("hsmActiveAlert")
-        if (enableLogging) log.debug "HSM alert cancelled — cleared active alert state"
-    } else {
-        state.hsmActiveAlert = evt.value
-        if (enableLogging) log.debug "HSM alert received: ${evt.value}"
+    def v = evt.value?.toString()
+    // HSM uses TWO distinct cancel values: "cancel" for intrusion/smoke/water
+    // alerts and "cancelRuleAlerts" for custom-rule alerts. Honoring only
+    // "cancel" (pre-1.56 behavior) left CUSTOM RULE alerts latched forever.
+    if (v in ["cancel", "cancelRuleAlerts"]) {
+        clearHsmActiveAlert()
+        if (enableLogging) log.debug "HSM alert cancelled (${v}) — cleared active alert state"
+    } else if (v in ["arming", "armingHome", "armingNight"]) {
+        // Transient arming / failed-to-arm notices — not ongoing alerts.
+        // Latching these would leave a stuck banner with no cancel event to clear it.
+        if (enableLogging) log.debug "HSM arming notice (${v}) — not stored as an active alert"
+    } else if (v) {
+        state.hsmActiveAlert     = v
+        state.hsmActiveAlertRule = (v == "rule") ? (evt.descriptionText ?: "").toString() : ""
+        state.hsmActiveAlertAt   = new Date().format("yyyy-MM-dd hh:mm a", location.timeZone)
+        if (enableLogging) log.debug "HSM alert received: ${v}${evt.descriptionText ? ' — ' + evt.descriptionText : ''}"
     }
+}
+
+private void clearHsmActiveAlert() {
+    state.remove("hsmActiveAlert")
+    state.remove("hsmActiveAlertRule")
+    state.remove("hsmActiveAlertAt")
 }
 
 def appButtonHandler(btn) {
     if (btn == "btnResetAppLabel") {
         resetAppInstanceLabel()
+        return
+    }
+    if (btn == "btnClearHsmAlert") {
+        clearHsmActiveAlert()
+        log.info "HSM alert display cleared manually"
         return
     }
     if (enableLogging) log.debug "Button pressed: ${btn}"
@@ -767,19 +1033,12 @@ private void loadRemoteDeviceList(int hubNum, String ip, String appId, String to
     def uri        = "http://${ip}/apps/api/${appId}/devices?access_token=${token}"
     def switchList  = []
     def lockList    = []
+    def contactList = []
     def allList     = []
     def disabledIds = []
     try {
-        httpGet([uri: uri, contentType: "application/json", timeout: 15]) { resp ->
-            if (resp.status != 200) {
-                state["hub${hubNum}Devices"]     = []
-                state["hub${hubNum}LockDevices"] = []
-                state["hub${hubNum}AllDevices"]  = []
-                state["hub${hubNum}DisabledIds"] = []
-                state["hub${hubNum}LoadStatus"]  = "Error: HTTP ${resp.status}"
-                return
-            }
-            resp.data?.each { dev ->
+        def respData = fetchJson(uri, 15)
+        respData?.each { dev ->
                 if (enableLogging && switchList.isEmpty() && allList.isEmpty())
                     log.debug "${hubLabel}: first device raw = id:${dev.id} disabled:${dev.disabled} status:${dev.status} caps:${dev.capabilities}"
                 def isDisabled = dev.disabled == true || dev.disabled?.toString() == "true" ||
@@ -793,23 +1052,25 @@ private void loadRemoteDeviceList(int hubNum, String ip, String appId, String to
                     disabledIds << dev.id?.toString()
                 } else {
                     allList << devEntry
-                    if (hasSwitchCapability(dev.capabilities)) switchList << devEntry
-                    if (hasLockCapability(dev.capabilities))   lockList   << devEntry
+                    if (hasSwitchCapability(dev.capabilities))  switchList  << devEntry
+                    if (hasLockCapability(dev.capabilities))    lockList    << devEntry
+                    if (hasContactCapability(dev.capabilities)) contactList << devEntry
                 }
-            }
         }
-        state["hub${hubNum}Devices"]     = switchList
-        state["hub${hubNum}LockDevices"] = lockList
-        state["hub${hubNum}AllDevices"]  = allList
-        state["hub${hubNum}DisabledIds"] = disabledIds
-        state["hub${hubNum}LoadStatus"]  = "OK: ${switchList.size()} switch / ${lockList.size()} lock device${switchList.size() == 1 ? '' : 's'} loaded (${allList.size()} enabled, ${disabledIds.size()} disabled)"
-        log.info "${hubLabel}: Loaded ${switchList.size()} switch, ${lockList.size()} lock, ${allList.size()} enabled, ${disabledIds.size()} disabled."
+        state["hub${hubNum}Devices"]        = switchList
+        state["hub${hubNum}LockDevices"]    = lockList
+        state["hub${hubNum}ContactDevices"] = contactList
+        state["hub${hubNum}AllDevices"]     = allList
+        state["hub${hubNum}DisabledIds"]    = disabledIds
+        state["hub${hubNum}LoadStatus"]  = "OK: ${switchList.size()} switch / ${lockList.size()} lock / ${contactList.size()} contact device${switchList.size() == 1 ? '' : 's'} loaded (${allList.size()} enabled, ${disabledIds.size()} disabled)"
+        log.info "${hubLabel}: Loaded ${switchList.size()} switch, ${lockList.size()} lock, ${contactList.size()} contact, ${allList.size()} enabled, ${disabledIds.size()} disabled."
     } catch (Exception e) {
         log.error "${hubLabel}: Error loading device list — ${e.message}"
-        state["hub${hubNum}Devices"]     = []
-        state["hub${hubNum}LockDevices"] = []
-        state["hub${hubNum}AllDevices"]  = []
-        state["hub${hubNum}DisabledIds"] = []
+        state["hub${hubNum}Devices"]        = []
+        state["hub${hubNum}LockDevices"]    = []
+        state["hub${hubNum}ContactDevices"] = []
+        state["hub${hubNum}AllDevices"]     = []
+        state["hub${hubNum}DisabledIds"]    = []
         state["hub${hubNum}LoadStatus"]  = "Error: ${e.message}"
     }
 }
@@ -833,19 +1094,13 @@ private void loadHub1AllDevices() {
     def uri         = "http://${hub1LocalIp}:8080/apps/api/${appId}/devices?access_token=${token}"
     def allList = []
     try {
-        httpGet([uri: uri, contentType: "application/json", timeout: 15]) { resp ->
-            if (resp.status != 200) {
-                state["hub1AllDevices"]       = []
-                state["hub1AllDevicesStatus"] = "Error: HTTP ${resp.status}"
-                return
-            }
-            resp.data?.each { dev ->
-                allList << [
-                    id  : dev.id?.toString(),
-                    name: (dev.label ?: dev.name ?: "Unknown").toString(),
-                    room: (dev.room ?: "").toString()
-                ]
-            }
+        def respData = fetchJson(uri, 15)
+        respData?.each { dev ->
+            allList << [
+                id  : dev.id?.toString(),
+                name: (dev.label ?: dev.name ?: "Unknown").toString(),
+                room: (dev.room ?: "").toString()
+            ]
         }
         state["hub1AllDevices"]       = allList
         state["hub1AllDevicesStatus"] = "OK: ${allList.size()} device${allList.size() == 1 ? '' : 's'} loaded"
@@ -889,6 +1144,7 @@ private Map collectAllDeviceStates() {
     def onPool               = []
     def offPool              = []
     def lockPool             = []
+    def contactPool          = []
     def healthPool           = []
     def warnings             = []
     def activityThreshHours  = (settings["activityThresholdHours"] ?: 24) as long
@@ -967,6 +1223,14 @@ private Map collectAllDeviceStates() {
                      hub: hub1LabelVal, linkUrl: "/device/edit/${dev.id}",
                      lockVal: dev.currentValue("lock")?.toString()?.toLowerCase() ?: "unknown",
                      battery: dev.currentValue("battery")?.toString() ?: "n/a"]
+    }
+    // Contact pool – Hub #1 (hand-picked like locks, so the virtual-device
+    // exclusion filter is intentionally not applied)
+    (devsContact ?: []).findAll(filterLock).each { dev ->
+        contactPool << [displayName: dev.displayName, room: resolveLocalRoom(dev, roomMap),
+                        hub: hub1LabelVal, linkUrl: "/device/edit/${dev.id}",
+                        contactVal: dev.currentValue("contact")?.toString()?.toLowerCase() ?: "unknown",
+                        battery: dev.currentValue("battery")?.toString() ?: "n/a"]
     }
     // Health pool – Hub #1
     // Primary source: hub1HealthDevs (capability.* picker) — direct device objects.
@@ -1063,6 +1327,18 @@ private Map collectAllDeviceStates() {
             })
         }
 
+        // — Contact pool —
+        def ctRaw  = settings["hub${hubNum}SelectedContactDevices"]
+        def ctIds  = (ctRaw instanceof List ? ctRaw : (ctRaw ? [ctRaw] : []))*.toString() as Set
+        if (ctIds) {
+            def (ctEntries, ctWarn) = fetchRemoteContactStates(ip, appId, token, hubLabel, excludeVirt, excludeSysRoom, ctIds)
+            if (ctWarn && !warnings.contains(ctWarn)) warnings << ctWarn
+            contactPool.addAll(ctEntries.collect { e ->
+                [displayName: e.displayName, room: e.room, hub: hubLabel,
+                 linkUrl: e.linkUrl, contactVal: e.contactVal, battery: e.battery ?: "n/a"]
+            })
+        }
+
         // — Health pool —
         def healthRaw    = settings["hub${hubNum}SelectedHealthDevices"]
         def healthIds    = (healthRaw instanceof List ? healthRaw : (healthRaw ? [healthRaw] : []))*.toString() as Set
@@ -1086,7 +1362,7 @@ private Map collectAllDeviceStates() {
         }
     }
 
-    return [onPool: onPool, offPool: offPool, lockPool: lockPool, healthPool: healthPool, warnings: warnings]
+    return [onPool: onPool, offPool: offPool, lockPool: lockPool, contactPool: contactPool, healthPool: healthPool, warnings: warnings]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1108,12 +1384,8 @@ private List fetchRemoteDeviceStates(String ip, String appId, String token,
 
     try {
         if (enableLogging) log.debug "Querying ${hubLabel} — ids: ${selectedIds}"
-        httpGet([uri: uri, contentType: "application/json", timeout: 10]) { resp ->
-            if (resp.status != 200) {
-                warning = "${hubLabel}: Unexpected HTTP status ${resp.status}."
-                return
-            }
-            resp.data?.each { dev ->
+        def respData = fetchJson(uri, 10)
+        respData?.each { dev ->
                 def devId = dev.id?.toString()
                 if (!selectedIds.contains(devId)) return
                 if (!hasSwitchCapability(dev.capabilities)) {
@@ -1140,17 +1412,13 @@ private List fetchRemoteDeviceStates(String ip, String appId, String token,
                 if (switchVal == null) {
                     if (enableLogging) log.debug "${hubLabel} device ${devId}: fetching individually for switch state"
                     try {
-                        httpGet([uri: "http://${ip}/apps/api/${appId}/devices/${devId}?access_token=${token}",
-                                 contentType: "application/json", timeout: 5]) { devResp ->
-                            if (devResp.status == 200) {
-                                def da = devResp.data?.attributes
-                                if (da instanceof List) {
-                                    def sw2 = da.find { a -> a?.name?.toString() == "switch" }
-                                    switchVal = sw2?.currentValue?.toString()?.toLowerCase()
-                                } else if (da instanceof Map) {
-                                    switchVal = da["switch"]?.toString()?.toLowerCase()
-                                }
-                            }
+                        def devData = fetchJson("http://${ip}/apps/api/${appId}/devices/${devId}?access_token=${token}", 5)
+                        def da = devData?.attributes
+                        if (da instanceof List) {
+                            def sw2 = da.find { a -> a?.name?.toString() == "switch" }
+                            switchVal = sw2?.currentValue?.toString()?.toLowerCase()
+                        } else if (da instanceof Map) {
+                            switchVal = da["switch"]?.toString()?.toLowerCase()
                         }
                     } catch (Exception fe) {
                         if (enableLogging) log.warn "${hubLabel} device ${devId}: fallback fetch failed — ${fe.message}"
@@ -1169,7 +1437,6 @@ private List fetchRemoteDeviceStates(String ip, String appId, String token,
                             room: (dev.room ?: "—").toString(),
                             linkUrl: "http://${ip}/device/edit/${devId}", switchVal: switchVal,
                             toggleOnUrl: toggleOnUrl, toggleOffUrl: toggleOffUrl]
-            }
         }
     } catch (java.net.SocketTimeoutException e) {
         warning = "${hubLabel} (${ip}): Connection timed out — hub may be offline."
@@ -1202,12 +1469,8 @@ private List fetchRemoteLockStates(String ip, String appId, String token,
 
     def uri = "http://${ip}/apps/api/${appId}/devices?access_token=${token}"
     try {
-        httpGet([uri: uri, contentType: "application/json", timeout: 10]) { resp ->
-            if (resp.status != 200) {
-                warning = "${hubLabel}: Unexpected HTTP status ${resp.status} (lock fetch)."
-                return
-            }
-            resp.data?.each { dev ->
+        def respData = fetchJson(uri, 10)
+        respData?.each { dev ->
                 def devId = dev.id?.toString()
                 if (!selectedIds.contains(devId)) return
                 if (dev.disabled == true || dev.disabled?.toString() == "true" ||
@@ -1231,17 +1494,13 @@ private List fetchRemoteLockStates(String ip, String appId, String token,
                 // Fall back to per-device fetch if not in bulk response
                 if (lockVal == null) {
                     try {
-                        httpGet([uri: "http://${ip}/apps/api/${appId}/devices/${devId}?access_token=${token}",
-                                 contentType: "application/json", timeout: 5]) { devResp ->
-                            if (devResp.status == 200) {
-                                def da = devResp.data?.attributes
-                                if (da instanceof List) {
-                                    def lk2 = da.find { a -> a?.name?.toString() == "lock" }
-                                    lockVal = lk2?.currentValue?.toString()?.toLowerCase()
-                                } else if (da instanceof Map) {
-                                    lockVal = da["lock"]?.toString()?.toLowerCase()
-                                }
-                            }
+                        def devData = fetchJson("http://${ip}/apps/api/${appId}/devices/${devId}?access_token=${token}", 5)
+                        def da = devData?.attributes
+                        if (da instanceof List) {
+                            def lk2 = da.find { a -> a?.name?.toString() == "lock" }
+                            lockVal = lk2?.currentValue?.toString()?.toLowerCase()
+                        } else if (da instanceof Map) {
+                            lockVal = da["lock"]?.toString()?.toLowerCase()
                         }
                     } catch (Exception fe) {
                         if (enableLogging) log.warn "${hubLabel} device ${devId}: lock fallback fetch failed — ${fe.message}"
@@ -1261,7 +1520,6 @@ private List fetchRemoteLockStates(String ip, String appId, String token,
                             linkUrl    : "http://${ip}/device/edit/${devId}",
                             lockVal    : lockVal ?: "unknown",
                             battery    : lockBatteryVal]
-            }
         }
     } catch (java.net.SocketTimeoutException e) {
         warning = "${hubLabel} (${ip}): Connection timed out (lock fetch) — hub may be offline."
@@ -1272,6 +1530,89 @@ private List fetchRemoteLockStates(String ip, String appId, String token,
     } catch (Exception e) {
         warning = "${hubLabel} (${ip}): Error (lock fetch) — ${e.message}"
         if (enableLogging) log.error "Unexpected error querying ${hubLabel} locks: ${e}"
+    }
+
+    return [results, warning]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REMOTE CONTACT SENSOR STATE FETCHER
+// ─────────────────────────────────────────────────────────────────────────────
+
+private List fetchRemoteContactStates(String ip, String appId, String token,
+                                      String hubLabel, boolean excludeVirt,
+                                      boolean excludeSysRoom, Set selectedIds) {
+    def results = []
+    def warning = null
+
+    if (!ip || !appId || !token) {
+        warning = "${hubLabel}: Missing credentials for contact sensor monitor — skipped."
+        return [results, warning]
+    }
+
+    def uri = "http://${ip}/apps/api/${appId}/devices?access_token=${token}"
+    try {
+        def respData = fetchJson(uri, 10)
+        respData?.each { dev ->
+                def devId = dev.id?.toString()
+                if (!selectedIds.contains(devId)) return
+                if (dev.disabled == true || dev.disabled?.toString() == "true" ||
+                    (dev.status ?: "").toString().toUpperCase() == "DISABLED") return
+                if (excludeVirt && (
+                    (dev.type ?: "").toString().toLowerCase().contains("virtual") ||
+                    (dev.label ?: dev.name ?: "").toString().startsWith("VD ")
+                )) return
+                if (excludeSysRoom && (dev.room ?: "").toString() == "System") return
+
+                // Try to read contact attribute from bulk response
+                def contactVal = null
+                def attrsField = dev.attributes
+                if (attrsField instanceof List) {
+                    def ct = attrsField.find { a -> a?.name?.toString() == "contact" }
+                    contactVal = ct?.currentValue?.toString()?.toLowerCase()
+                } else if (attrsField instanceof Map) {
+                    contactVal = attrsField["contact"]?.toString()?.toLowerCase()
+                }
+
+                // Fall back to per-device fetch if not in bulk response
+                if (contactVal == null) {
+                    try {
+                        def devData = fetchJson("http://${ip}/apps/api/${appId}/devices/${devId}?access_token=${token}", 5)
+                        def da = devData?.attributes
+                        if (da instanceof List) {
+                            def ct2 = da.find { a -> a?.name?.toString() == "contact" }
+                            contactVal = ct2?.currentValue?.toString()?.toLowerCase()
+                        } else if (da instanceof Map) {
+                            contactVal = da["contact"]?.toString()?.toLowerCase()
+                        }
+                    } catch (Exception fe) {
+                        if (enableLogging) log.warn "${hubLabel} device ${devId}: contact fallback fetch failed — ${fe.message}"
+                    }
+                }
+
+                def ctBatteryVal = "n/a"
+                if (attrsField instanceof List) {
+                    def ba = attrsField.find { a -> a?.name?.toString() == "battery" }
+                    ctBatteryVal = ba?.currentValue?.toString() ?: "n/a"
+                } else if (attrsField instanceof Map) {
+                    ctBatteryVal = attrsField["battery"]?.toString() ?: "n/a"
+                }
+                results << [devId      : devId,
+                            displayName: (dev.label ?: dev.name ?: "Unknown").toString(),
+                            room       : (dev.room ?: "—").toString(),
+                            linkUrl    : "http://${ip}/device/edit/${devId}",
+                            contactVal : contactVal ?: "unknown",
+                            battery    : ctBatteryVal]
+        }
+    } catch (java.net.SocketTimeoutException e) {
+        warning = "${hubLabel} (${ip}): Connection timed out (contact fetch) — hub may be offline."
+        if (enableLogging) log.warn "Timeout querying ${hubLabel} contacts: ${e}"
+    } catch (java.net.ConnectException e) {
+        warning = "${hubLabel} (${ip}): Could not connect (contact fetch) — check IP address."
+        if (enableLogging) log.warn "Connection refused for ${hubLabel} contacts: ${e}"
+    } catch (Exception e) {
+        warning = "${hubLabel} (${ip}): Error (contact fetch) — ${e.message}"
+        if (enableLogging) log.error "Unexpected error querying ${hubLabel} contacts: ${e}"
     }
 
     return [results, warning]
@@ -1305,12 +1646,10 @@ private List fetchRemoteHealthDeviceStates(String ip, String appId, String token
     // which makes this the most reliable runtime disabled-device filter available via the API.
     def liveIds = null as Set
     try {
-        httpGet([uri: "http://${ip}/apps/api/${appId}/devices?access_token=${token}",
-                 contentType: "application/json", timeout: 10]) { listResp ->
-            if (listResp.status == 200 && listResp.data instanceof List) {
-                liveIds = listResp.data.collect { it.id?.toString() } as Set
-                if (enableLogging) log.debug "${hubLabel}: live device list has ${liveIds.size()} IDs"
-            }
+        def listData = fetchJson("http://${ip}/apps/api/${appId}/devices?access_token=${token}", 10)
+        if (listData instanceof List) {
+            liveIds = listData.collect { it.id?.toString() } as Set
+            if (enableLogging) log.debug "${hubLabel}: live device list has ${liveIds.size()} IDs"
         }
     } catch (Exception listEx) {
         if (enableLogging) log.debug "${hubLabel}: live device list fetch failed (disabled check unavailable) — ${listEx.message}"
@@ -1330,10 +1669,8 @@ private List fetchRemoteHealthDeviceStates(String ip, String appId, String token
         try {
             def uri = "http://${ip}/apps/api/${appId}/devices/${devId}?access_token=${token}"
             if (enableLogging) log.debug "Health check ${hubLabel} device ${devId}"
-            httpGet([uri: uri, contentType: "application/json", timeout: 10]) { resp ->
-                if (resp.status != 200) { errors << "device ${devId}: HTTP ${resp.status}"; return }
-                def dev = resp.data
-                if (!dev) return
+            def dev = fetchJson(uri, 10)
+            if (!dev) return
                 if (dev.disabled == true || dev.disabled?.toString() == "true" ||
                     (dev.status ?: "").toString().toUpperCase() == "DISABLED") return
 
@@ -1403,11 +1740,8 @@ private List fetchRemoteHealthDeviceStates(String ip, String appId, String token
                         // Try parent device endpoint first, then parent events
                         Date pd = null
                         try {
-                            httpGet([uri: "http://${ip}/apps/api/${appId}/devices/${parentId}?access_token=${token}",
-                                     contentType: "application/json", timeout: 10]) { pResp ->
-                                if (pResp.status == 200 && pResp.data)
-                                    pd = parseRemoteLastActivity(pResp.data.lastActivity, hubLabel, "${parentId}-p")
-                            }
+                            def pData = fetchJson("http://${ip}/apps/api/${appId}/devices/${parentId}?access_token=${token}", 10)
+                            if (pData) pd = parseRemoteLastActivity(pData.lastActivity, hubLabel, "${parentId}-p")
                         } catch (ignored) {}
                         if (pd == null) pd = fetchLastActivityFromEvents(ip, appId, token, parentId, hubLabel)
                         parentCache[parentId] = pd
@@ -1451,7 +1785,6 @@ private List fetchRemoteHealthDeviceStates(String ip, String appId, String token
                     battery        : batteryVal,
                     lastBattery    : lastBattVal
                 ]
-            }
         } catch (java.net.SocketTimeoutException e) {
             errors << "device ${devId}: timed out"
             if (enableLogging) log.warn "${hubLabel} device ${devId}: timeout — ${e}"
@@ -1476,15 +1809,14 @@ private Date fetchLastActivityFromEvents(String ip, String appId, String token,
     Date result = null
     try {
         def uri = "http://${ip}/apps/api/${appId}/devices/${devId}/events?access_token=${token}"
-        httpGet([uri: uri, contentType: "application/json", timeout: 10]) { resp ->
-            if (resp.status == 200 && resp.data instanceof List && resp.data.size() > 0) {
-                def event   = resp.data[0]
-                def dateVal = event.date ?: event.time ?: event.isoDate
-                result = parseRemoteLastActivity(dateVal, hubLabel, "${devId}-evt")
-                if (enableLogging) log.debug "${hubLabel} ${devId}: events → raw='${dateVal}' parsed=${result}"
-            } else if (enableLogging) {
-                log.debug "${hubLabel} ${devId}: events → status=${resp.status} count=${resp.data instanceof List ? resp.data.size() : 'n/a'}"
-            }
+        def evData = fetchJson(uri, 10)
+        if (evData instanceof List && evData.size() > 0) {
+            def event   = evData[0]
+            def dateVal = event.date ?: event.time ?: event.isoDate
+            result = parseRemoteLastActivity(dateVal, hubLabel, "${devId}-evt")
+            if (enableLogging) log.debug "${hubLabel} ${devId}: events → raw='${dateVal}' parsed=${result}"
+        } else if (enableLogging) {
+            log.debug "${hubLabel} ${devId}: events → count=${evData instanceof List ? evData.size() : 'n/a'}"
         }
     } catch (Exception e) {
         if (enableLogging) log.debug "${hubLabel} ${devId}: events fetch failed — ${e.message}"
@@ -1529,63 +1861,322 @@ private String buildHealthIssueLabel(String rawStatus, String rawHealthSt,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HSM ALERT VERIFICATION (added in 1.57)
+// HSM has NO query API for active alerts — it only publishes hsmAlert location
+// events, so a single missed event leaves the badge wrong forever. These
+// helpers read the hub's own pages at refresh time to reconcile the badge:
+//   1. If the HSM app ID is configured, GET the HSM app page
+//      (/installedapp/configure/<id>) — it shows "ALERT!" in its heading and
+//      lists the live alerts, e.g. "Custom Rule Alert: Door Locks unlocked".
+//   2. Otherwise GET the Apps list (/installedapp/list) and look for the red
+//      "ALERT!" suffix HSM appends to its own app label while alerting.
+// Both are local (127.0.0.1) reads on Hub #1. If Hub Login Security is
+// enabled these pages return a login page and verification reports
+// "unavailable" — the badge then falls back to event-only behavior.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Plain-text page fetcher — same defensive body handling as fetchJson(), but
+// with no JSON requirement (these are HTML pages).
+private String fetchRawText(String uri, int timeoutSec) {
+    String body = null
+    httpGet([uri: uri, contentType: "text/plain", headers: ["Accept": "*/*"], timeout: timeoutSec]) { resp ->
+        if (resp.status != 200) throw new Exception("HTTP ${resp.status}")
+        def d = resp.data
+        if (d == null) {
+            body = ""
+        } else if (d instanceof String) {
+            body = d
+        } else {
+            try { body = d.text } catch (ignore) { body = d.toString() }
+        }
+    }
+    return body ?: ""
+}
+
+private boolean looksLikeLoginPage(String body) {
+    def lower = body.toLowerCase()
+    return (lower.contains("login") || lower.contains("password")) && !lower.contains("safety monitor")
+}
+
+// Returns [status: "alerting" | "clear" | null, detail: String or null]
+// status null means the state could not be determined (leave badge as-is).
+// Hub #1 wrapper — reads the local hub over loopback.
+private Map pollHsmAlertFromHub() {
+    return pollHsmAlertFromHost("http://127.0.0.1:8080", settings["hsmAppId"], "Hub #1")
+}
+
+// Generic version (added in 1.58) — works against any hub base URL, so the
+// same verification code path serves Hub #1 and remote Hubs #2/#3.
+private Map pollHsmAlertFromHost(String base, def hsmId, String hubTag) {
+
+    // ── Preferred source: the HSM app page itself ────────────────────────────
+    if (hsmId) {
+        try {
+            String body = fetchRawText("${base}/installedapp/configure/${hsmId}", 8)
+            if (body && !looksLikeLoginPage(body) && body.contains("Safety Monitor")) {
+                // Live alert lines, e.g. "Custom Rule Alert: Door Locks unlocked",
+                // "Intrusion Alert: Front Door open", "Water Alert: ..."
+                def details = []
+                def dm = (body =~ /((?:Intrusion|Smoke|Water|Gas|Carbon Monoxide|Custom Rule)[^:<>\r\n]{0,30}?Alert)\s*:\s*([^<\r\n]{1,120})/)
+                while (dm.find()) {
+                    details << "${dm.group(1).trim()}: ${dm.group(2).trim()}".toString()
+                }
+                // "ALERT!" in the page heading (case-sensitive on purpose so
+                // lowercase JavaScript alert( calls can never false-positive)
+                boolean headingAlert = (body =~ /(?s)Safety\s+Monitor.{0,160}?ALERT/).find()
+                if (details || headingAlert) {
+                    return [status: "alerting", detail: details ? details.unique().join("; ") : null]
+                }
+                return [status: "clear", detail: null]
+            }
+            if (enableLogging) log.debug "HSM verify (${hubTag}): app page for ID ${hsmId} unusable (login page or no HSM content) — trying Apps list"
+        } catch (Exception e) {
+            if (enableLogging) log.debug "HSM verify (${hubTag}): app page fetch failed — ${e.message}"
+        }
+    }
+
+    // ── Fallback source: the Apps list (HSM label carries "ALERT!") ─────────
+    // Note: "/hub2/appsList" is the hub UI's internal JSON endpoint name on
+    // EVERY hub — it has nothing to do with this app's "Hub #2".
+    def listUris = ["${base}/installedapp/list",
+                    "${base}/hub2/appsList"]
+    for (uri in listUris) {
+        try {
+            String body = fetchRawText(uri, 6)
+            if (!body || looksLikeLoginPage(body)) continue
+            if (!body.contains("Safety Monitor")) continue   // page didn't include app labels
+            boolean alerting = (body =~ /(?s)Safety\s+Monitor.{0,160}?ALERT/).find()
+            return [status: alerting ? "alerting" : "clear", detail: null]
+        } catch (Exception e) {
+            if (enableLogging) log.debug "HSM verify (${hubTag}): ${uri} failed — ${e.message}"
+        }
+    }
+    return [status: null, detail: null]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REMOTE HSM STATUS (added in 1.58)
+// Maker API exposes the HSM arm state at /apps/api/<id>/hsm when the HSM
+// toggle is enabled inside that hub's Maker API app. Alerts are NOT exposed
+// by Maker API, so remote alerts use pollHsmAlertFromHost() page scraping.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Returns the hsmStatus value string (e.g. "armedAway", "disarmed") or null.
+private String fetchRemoteHsmStatus(String ip, String appId, String token) {
+    try {
+        def data = fetchJson("http://${ip}/apps/api/${appId}/hsm?access_token=${token}", 8)
+        if (data instanceof Map) {
+            def v = data.hsm ?: data.status ?: data.value
+            return v ? v.toString() : null
+        }
+        if (data instanceof List && data && data[0] instanceof Map) {
+            def v = data[0].hsm ?: data[0].status
+            return v ? v.toString() : null
+        }
+        return data != null ? data.toString() : null
+    } catch (Exception e) {
+        if (enableLogging) log.warn "Remote HSM status fetch failed for ${ip}: ${e.message}"
+        return null
+    }
+}
+
+// Reconcile the latched alert state with what the hub actually shows.
+// Runs at the start of every report refresh when verification is enabled.
+private void reconcileHsmAlertWithHub() {
+    def poll = pollHsmAlertFromHub()
+    state.hsmAlertPollResult = poll.status ?: "unavailable"
+
+    if (poll.status == "clear") {
+        if (state.hsmActiveAlert) {
+            log.info "HSM verify: hub shows no active alert — clearing stale '${state.hsmActiveAlert}' alert display"
+            clearHsmActiveAlert()
+        }
+    } else if (poll.status == "alerting") {
+        if (!state.hsmActiveAlert) {
+            // Missed hsmAlert event — latch a detected alert now.
+            log.warn "HSM verify: hub shows an active alert but no hsmAlert event was captured — displaying it now"
+            state.hsmActiveAlert     = "detected"
+            state.hsmActiveAlertRule = poll.detail ?: ""
+            state.hsmActiveAlertAt   = new Date().format("yyyy-MM-dd hh:mm a", location.timeZone)
+        } else if (poll.detail && !state.hsmActiveAlertRule) {
+            // Event-latched alert without detail — enrich it from the HSM page.
+            state.hsmActiveAlertRule = poll.detail
+        }
+    }
+    // status null → could not verify; leave event-latched state untouched.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // HUBITAT SAFETY MONITOR (HSM) STATUS BADGE
 // ─────────────────────────────────────────────────────────────────────────────
 
-private String buildHsmStatusBadge() {
-    def hsmState = location.hsmStatus?.toString()
-    if (!hsmState || hsmState == "null") {
-        return "<p style='margin:4px 0;'><b>HSM:</b> <span style='color:#888;'>Not available</span></p>"
-    }
-
-    // hsmStatus values per Hubitat official docs (intrusion arm state only).
-    // Note: smoke/water rules arm via hsmRules (armAll), NOT hsmStatus — so
-    // hsmStatus can read "disarmed" even while smoke/water monitoring is active.
-    def displayMap = [
+// hsmStatus values per Hubitat official docs (intrusion arm state only).
+// Note: smoke/water rules arm via hsmRules (armAll), NOT hsmStatus — so
+// hsmStatus can read "disarmed" even while smoke/water monitoring is active.
+private Map hsmStatusDisplayMap() {
+    return [
         "armedAway"   : [label: "Armed Away",         color: "#cc0000", icon: "&#x1F534;"],
         "armingAway"  : [label: "Arming Away\u2026",  color: "#cc6600", icon: "&#x23F3;"],
         "armedHome"   : [label: "Armed Home",          color: "#cc6600", icon: "&#x1F7E0;"],
         "armingHome"  : [label: "Arming Home\u2026",   color: "#cc6600", icon: "&#x23F3;"],
         "armedNight"  : [label: "Armed Night",         color: "#8800cc", icon: "&#x1F7E3;"],
         "armingNight" : [label: "Arming Night\u2026",  color: "#8800cc", icon: "&#x23F3;"],
-        "disarmed"    : [label: "Disarmed",            color: "#1a7a1a", icon: "&#x1F7E2;"],
-        "allDisarmed" : [label: "All Disarmed",        color: "#1a7a1a", icon: "&#x1F7E2;"],
+        "disarmed"    : [label: "Intrusion Disarmed",     color: "#1a7a1a", icon: "&#x1F7E2;"],
+        "allDisarmed" : [label: "All Monitoring Disarmed", color: "#1a7a1a", icon: "&#x1F7E2;"],
     ]
-    def info  = displayMap[hsmState]
+}
+
+// hsmStatus "disarmed" means only INTRUSION is disarmed — smoke, water and
+// custom monitoring rules stay armed until All Monitoring is disarmed.
+private String hsmDisarmedNote(String hsmState) {
+    return (hsmState == "disarmed")
+        ? "&nbsp;<small style='color:#888;font-weight:normal;'>(smoke / water / custom monitoring remains armed unless All Monitoring is disarmed)</small>"
+        : ""
+}
+
+// Suffix appended to "HSM Status" / "HSM Alert" labels. Hub names are shown
+// on every line as soon as more than one hub's HSM is being displayed.
+private String hsmHubTag(String hubLabel) {
+    def anyRemote = settings["showHsmStatusHub2"] || settings["showHsmStatusHub3"]
+    return anyRemote ? " — ${htmlEscape(hubLabel)}" : ""
+}
+
+private String buildHsmStatusBadge() {
+    def hsmState = location.hsmStatus?.toString()
+    if (!hsmState || hsmState == "null") {
+        return "<p style='margin:4px 0;'><b>HSM:</b> <span style='color:#888;'>Not available</span></p>"
+    }
+    def hub1LabelVal = settings["hub1Label"] ?: (location.name ?: "Hub 1")
+    def hubTag = hsmHubTag(hub1LabelVal)
+    def info  = hsmStatusDisplayMap()[hsmState]
     def label = info?.label ?: hsmState
     def color = info?.color ?: "#555555"
     def icon  = info?.icon  ?: "&#x1F512;"
+    def statusNote = hsmDisarmedNote(hsmState)
     def html = "<p style='margin:6px 0 4px 0;font-size:1.05em;'>" +
-               "<b>HSM Status:</b>&nbsp;" +
+               "<b>HSM Status${hubTag}:</b>&nbsp;" +
                "<span style='color:${color};font-weight:bold;'>${icon} ${htmlEscape(label)}</span>" +
+               statusNote +
                "</p>"
 
-    // Active alert — set by hsmAlertHandler when hsmAlert fires, cleared on cancel.
+    // Active alert — set by hsmAlertHandler when hsmAlert fires, cleared on
+    // cancel / cancelRuleAlerts or via the "Clear HSM Alert Display" button.
     def activeAlert = state.hsmActiveAlert?.toString()
-    def alertDisplayMap = [
-        "intrusion"      : [label: "INTRUSION (Away)",  color: "#cc0000"],
-        "intrusion-home" : [label: "INTRUSION (Home)",  color: "#cc0000"],
-        "intrusion-night": [label: "INTRUSION (Night)", color: "#cc0000"],
-        "smoke"          : [label: "SMOKE",             color: "#cc0000"],
-        "water"          : [label: "WATER LEAK",        color: "#0055cc"],
-        "rule"           : [label: "CUSTOM RULE",       color: "#cc6600"],
-    ]
+    // Defensive: purge values a pre-1.56 handler may have latched by mistake.
+    if (activeAlert in ["cancel", "cancelRuleAlerts", "arming", "armingHome", "armingNight"]) {
+        clearHsmActiveAlert()
+        activeAlert = null
+    }
     if (activeAlert) {
+        def alertDisplayMap = [
+            "intrusion"      : [label: "INTRUSION (Away)",  color: "#cc0000"],
+            "intrusion-home" : [label: "INTRUSION (Home)",  color: "#cc0000"],
+            "intrusion-night": [label: "INTRUSION (Night)", color: "#cc0000"],
+            "smoke"          : [label: "SMOKE",             color: "#cc0000"],
+            "water"          : [label: "WATER LEAK",        color: "#0055cc"],
+            "rule"           : [label: "CUSTOM RULE",       color: "#cc6600"],
+            "detected"       : [label: "ACTIVE ALERT",      color: "#cc0000"],
+        ]
         def aInfo  = alertDisplayMap[activeAlert]
         def aLabel = aInfo?.label ?: activeAlert
         def aColor = aInfo?.color ?: "#cc0000"
+        def ruleName = state.hsmActiveAlertRule?.toString() ?: ""
+        if (ruleName) aLabel += " — ${ruleName}"
+        def sinceStr = state.hsmActiveAlertAt
+            ? ((activeAlert == "detected" ? " detected " : " since ") + state.hsmActiveAlertAt)
+            : ""
         html += "<p style='margin:2px 0 10px 0;font-size:1.05em;'>" +
-                "<b>HSM Alert:</b>&nbsp;" +
+                "<b>HSM Alert${hubTag}:</b>&nbsp;" +
                 "<span style='color:${aColor};font-weight:bold;animation:dsm-hsm-blink 0.8s step-start infinite;'>" +
                 "&#x1F6A8; ${htmlEscape(aLabel)}" +
                 "</span>" +
-                "&nbsp;<small style='color:#888;font-weight:normal;'>(clears automatically when HSM alert is cancelled)</small>" +
+                "&nbsp;<small style='color:#888;font-weight:normal;'>(${htmlEscape(sinceStr ? sinceStr.trim() + ' — ' : '')}clears when HSM cancels the alert, or use the Clear HSM Alert Display button above)</small>" +
                 "</p>" +
                 "<style>@keyframes dsm-hsm-blink{50%{opacity:0}}</style>"
     } else {
         html += "<p style='margin:2px 0 10px 0;font-size:1.05em;'>" +
-                "<b>HSM Alert:</b>&nbsp;" +
+                "<b>HSM Alert${hubTag}:</b>&nbsp;" +
                 "<span style='color:#1a7a1a;font-weight:bold;'>No current alert</span>" +
+                "</p>"
+    }
+
+    // Verification footnote — says whether the alert line above was checked
+    // against the hub on this refresh, or is running on events alone.
+    if (settings["hsmVerifyAlert"] != false) {
+        def pr = state.hsmAlertPollResult?.toString()
+        if (pr == "unavailable") {
+            html += "<p style='margin:0 0 8px 0;'><small style='color:#b36b00;'>" +
+                    "⚠ Alert verification unavailable — could not read the hub's Apps / HSM pages " +
+                    "(Hub Login Security may be enabled on Hub #1). Falling back to hsmAlert events only." +
+                    "</small></p>"
+        } else if (pr in ["alerting", "clear"]) {
+            def srcNote = settings["hsmAppId"] ? "HSM app page" : "hub Apps list"
+            html += "<p style='margin:0 0 8px 0;'><small style='color:#888;'>" +
+                    "Alert state verified against the ${srcNote} at refresh." +
+                    "</small></p>"
+        }
+    }
+    return html
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REMOTE HSM STATUS BADGE (Hubs #2 / #3, added in 1.58)
+// Status via the hub's Maker API /hsm endpoint; alert via the same page
+// verification used for Hub #1, pointed at the remote IP. Location events do
+// not cross hubs, so remote alert state is poll-only (refresh-time).
+// ─────────────────────────────────────────────────────────────────────────────
+
+private String buildRemoteHsmStatusBadge(int hubNum) {
+    if (!settings["hub${hubNum}Enabled"]) return ""
+    def hubLabel = settings["hub${hubNum}Label"] ?: "Hub ${hubNum}"
+    def ip       = settings["hub${hubNum}Ip"]
+    def appId    = settings["hub${hubNum}AppId"]
+    def token    = settings["hub${hubNum}Token"]
+    def hubTag   = " — ${htmlEscape(hubLabel)}"
+    def html     = ""
+
+    // ── Status (Maker API /hsm endpoint) ─────────────────────────────────────
+    def hsmState = (ip && appId && token) ? fetchRemoteHsmStatus(ip, appId, token) : null
+    if (hsmState) {
+        def info  = hsmStatusDisplayMap()[hsmState]
+        def label = info?.label ?: hsmState
+        def color = info?.color ?: "#555555"
+        def icon  = info?.icon  ?: "&#x1F512;"
+        html += "<p style='margin:6px 0 4px 0;font-size:1.05em;'>" +
+                "<b>HSM Status${hubTag}:</b>&nbsp;" +
+                "<span style='color:${color};font-weight:bold;'>${icon} ${htmlEscape(label)}</span>" +
+                hsmDisarmedNote(hsmState) +
+                "</p>"
+    } else {
+        html += "<p style='margin:6px 0 4px 0;font-size:1.05em;'>" +
+                "<b>HSM Status${hubTag}:</b>&nbsp;" +
+                "<span style='color:#888;'>Unavailable</span>" +
+                "&nbsp;<small style='color:#b36b00;'>(is the <b>HSM</b> toggle enabled in ${htmlEscape(hubLabel)}'s Maker API app? Is the hub reachable?)</small>" +
+                "</p>"
+    }
+
+    // ── Alert (page verification against the remote hub) ────────────────────
+    def poll = pollHsmAlertFromHost("http://${ip}", settings["hub${hubNum}HsmAppId"], hubLabel)
+    if (poll.status == "alerting") {
+        def aLabel = "ACTIVE ALERT" + (poll.detail ? " — ${poll.detail}" : "")
+        html += "<p style='margin:2px 0 10px 0;font-size:1.05em;'>" +
+                "<b>HSM Alert${hubTag}:</b>&nbsp;" +
+                "<span style='color:#cc0000;font-weight:bold;animation:dsm-hsm-blink 0.8s step-start infinite;'>" +
+                "&#x1F6A8; ${htmlEscape(aLabel)}" +
+                "</span>" +
+                "&nbsp;<small style='color:#888;font-weight:normal;'>(poll-only — updates on each refresh)</small>" +
+                "</p>" +
+                "<style>@keyframes dsm-hsm-blink{50%{opacity:0}}</style>"
+    } else if (poll.status == "clear") {
+        html += "<p style='margin:2px 0 10px 0;font-size:1.05em;'>" +
+                "<b>HSM Alert${hubTag}:</b>&nbsp;" +
+                "<span style='color:#1a7a1a;font-weight:bold;'>No current alert</span>" +
+                "</p>"
+    } else {
+        html += "<p style='margin:2px 0 10px 0;font-size:1.05em;'>" +
+                "<b>HSM Alert${hubTag}:</b>&nbsp;" +
+                "<span style='color:#888;'>Not verified</span>" +
+                "&nbsp;<small style='color:#b36b00;'>(could not read ${htmlEscape(hubLabel)}'s Apps / HSM pages — Hub Login Security may be enabled there)</small>" +
                 "</p>"
     }
     return html
@@ -1602,10 +2193,12 @@ private Map generateReportTables() {
     def onPool      = data.onPool
     def offPool     = data.offPool
     def lockPool    = data.lockPool
+    def contactPool = data.contactPool
     def healthPool  = data.healthPool
     def warnings    = data.warnings
     def showUnknown = settings["showUnknownTable"] != false
     def showLock    = settings["showLockTable"]    != false
+    def showContact = settings["showContactTable"] != false
     def showHealth  = settings["showHealthTable"]  != false
 
     def html = ""
@@ -1613,7 +2206,13 @@ private Map generateReportTables() {
 
     // ── Hubitat Safety Monitor (HSM) status ──────────────────────────────────
     if (settings["showHsmStatus"] != false) {
+        // Reconcile the latched alert with the hub's own pages first, so the
+        // badge below reflects reality even if an hsmAlert event was missed.
+        if (settings["hsmVerifyAlert"] != false) reconcileHsmAlertWithHub()
         html += buildHsmStatusBadge()
+        [2, 3].each { rn ->
+            if (settings["showHsmStatusHub${rn}"]) html += buildRemoteHsmStatusBadge(rn)
+        }
     }
 
     // Devices selected for BOTH the ON-monitor list and the OFF-monitor list
@@ -1654,6 +2253,16 @@ private Map generateReportTables() {
             "<b>Lock State</b>", "table_lock", "#2e5fa3",
             settings["sortByLock"]    ?: "displayName",
             settings["sortOrderLock"] ?: "asc")
+    }
+
+    // Contact Sensor table
+    if (showContact) {
+        html += "<br>"
+        html += buildContactTable(contactPool,
+            "table_contact", "#7a4fa3",
+            settings["sortByContact"]    ?: "displayName",
+            settings["sortOrderContact"] ?: "asc",
+            settings["contactOpenOnly"] != false)
     }
 
     // Health / Activity Monitor table
@@ -1787,6 +2396,91 @@ private String buildLockTable(List devices, String title, String tableId, String
             html += "<td class='dsm-col-room'>${it.room}</td>"
             html += "<td class='dsm-col-hub hub-col'>${it.hub}</td>"
             html += "<td class='state-col' style='${lockColor}'>${lv}</td>"
+            html += "<td style='text-align:center;${battColor}'>${battStr}</td>"
+            html += "</tr>"
+        }
+        html += "</tbody></table></div>"
+    }
+    return html
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONTACT SENSOR TABLE BUILDER
+// In open-only mode (default) the table lists just the sensors currently
+// reporting "open"; the heading still shows how many are monitored in total.
+// ─────────────────────────────────────────────────────────────────────────────
+
+private String buildContactTable(List devices, String tableId, String headerColor,
+                                 String sortBy, String sortOrder, boolean openOnly) {
+    def monitored = devices.size()
+    def openCount = devices.count { (it.contactVal ?: "") == "open" }
+    def shown     = openOnly ? devices.findAll { (it.contactVal ?: "") == "open" } : devices
+    def count     = shown.size()
+
+    def sortColIdx = 0
+    switch (sortBy) {
+        case "room":       sortColIdx = 1; break
+        case "hub":        sortColIdx = 2; break
+        case "contactVal": sortColIdx = 3; break
+        case "battery":    sortColIdx = 4; break
+        default:           sortColIdx = 0; break
+    }
+    def sortClass = (sortOrder == "desc") ? "sort-desc" : "sort-asc"
+
+    shown = shown.sort { it ->
+        switch (sortBy) {
+            case "room":       return it.room?.toLowerCase()       ?: ""
+            case "hub":        return it.hub?.toLowerCase()        ?: ""
+            case "contactVal": return it.contactVal?.toLowerCase() ?: ""
+            case "battery":
+                try { return (it.battery?.toString() == "n/a" ? -1 : it.battery?.toString()?.toInteger() ?: -1) } catch (ignored) { return -1 }
+            default:           return it.displayName?.toLowerCase() ?: ""
+        }
+    }
+    if (sortOrder == "desc") shown = shown.reverse()
+
+    def titleStr
+    if (openOnly) {
+        titleStr = (openCount > 0)
+            ? "<b>Open Contact Sensors</b>: <span style='color:#cc0000;'>${openCount} open</span> of ${monitored} monitored."
+            : "<b>Open Contact Sensors</b>: <span style='color:#1a7a1a;'>None open</span> (${monitored} monitored)."
+    } else {
+        def openNote = openCount > 0 ? " <span style='color:#cc0000;'>(${openCount} open)</span>" : ""
+        titleStr = "<b>Contact Sensor State</b>: ${monitored} device${monitored == 1 ? '' : 's'}${openNote}."
+    }
+    def html = "<h4 style='margin-bottom:4px;'>${titleStr}</h4><br>"
+
+    if (count > 0) {
+        html += "<div class='dsm-scroll-wrap'>"
+        html += "<table id='${tableId}' class='on-table' cellpadding='0' cellspacing='0' " +
+                "style='--hdr-bg:${headerColor};table-layout:fixed;width:100%;min-width:300px;'>"
+        html += "<colgroup><col><col class='dsm-col-room col-room'><col class='col-hub'><col style='width:110px'><col style='width:90px'></colgroup>"
+        html += "<thead><tr>"
+        html += "<th onclick='sortOnTable(\"${tableId}\",0)' class='${sortColIdx == 0 ? sortClass : ""}'>Sensor Name</th>"
+        html += "<th onclick='sortOnTable(\"${tableId}\",1)' class='dsm-col-room ${sortColIdx == 1 ? sortClass : ""}'>Room</th>"
+        html += "<th onclick='sortOnTable(\"${tableId}\",2)' class='dsm-col-hub ${sortColIdx == 2 ? sortClass : ""}'>Hub</th>"
+        html += "<th onclick='sortOnTable(\"${tableId}\",3)' class='${sortColIdx == 3 ? sortClass : ""}'>State</th>"
+        html += "<th onclick='sortOnTable(\"${tableId}\",4)' class='${sortColIdx == 4 ? sortClass : ""}'>Battery %</th>"
+        html += "</tr></thead><tbody>"
+
+        shown.each { it ->
+            def cv = it.contactVal?.toLowerCase() ?: "unknown"
+            def contactColor = (cv == "open")   ? "color:red;font-weight:bold;"   :
+                               (cv == "closed") ? "color:green;font-weight:bold;" :
+                                                  "color:#888;"
+            def battStr = it.battery?.toString() ?: "n/a"
+            def battColor = ""
+            if (battStr != "n/a") {
+                try {
+                    def battInt = battStr.toInteger()
+                    battColor = battInt < 20 ? "color:red;" : battInt < 40 ? "color:darkorange;" : "color:green;"
+                } catch (ignored) {}
+            }
+            html += "<tr>"
+            html += "<td><a href='${it.linkUrl}' target='_blank'>${it.displayName}</a></td>"
+            html += "<td class='dsm-col-room'>${it.room}</td>"
+            html += "<td class='dsm-col-hub hub-col'>${it.hub}</td>"
+            html += "<td class='state-col' style='${contactColor}'>${cv}</td>"
             html += "<td style='text-align:center;${battColor}'>${battStr}</td>"
             html += "</tr>"
         }
@@ -2147,6 +2841,93 @@ private String safeString(Object v) {
     return v == null ? "" : v.toString()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// HARDENED JSON FETCHER (added in 1.54)
+// Fetches the URI as raw text (no platform auto-parsing), then parses JSON
+// manually. If the hub returns anything that is not JSON (e.g. an HTML login
+// page or error page — the cause of "Lexing failed ... reading '<'" errors on
+// platform 2.5.1 beta), it throws a descriptive exception that includes the
+// HTTP status and the start of the actual response body, so the warning banner
+// tells you exactly WHAT the hub sent back.
+// ─────────────────────────────────────────────────────────────────────────────
+
+private Object fetchJson(String uri, int timeoutSec) {
+    // ── Workaround for platform 2.5.1.x (Apache HttpClient 5.6.1) ───────────
+    // The new HTTP client silently DROPS a query string embedded in the uri
+    // (see beta forum: "[2.5.1.112-116] (breaking change) httpPost/asynchttpPost
+    // drops the URI query string"). A Maker API request that loses its
+    // ?access_token= arrives unauthenticated and the remote hub answers with
+    // an HTML error page. Passing parameters via the query: map is carried on
+    // the wire correctly on both old and new clients, so split the uri here.
+    // Note: values are URL-decoded before being placed in the map because the
+    // client re-encodes them (avoids double-encoding). Maker API tokens are
+    // hex + dashes, so this is lossless for our URLs.
+    String base = uri
+    Map qmap = null
+    int qIdx = uri.indexOf('?')
+    if (qIdx >= 0) {
+        base = uri.substring(0, qIdx)
+        qmap = [:]
+        uri.substring(qIdx + 1).split('&').each { pair ->
+            if (!pair) return
+            int eq = pair.indexOf('=')
+            if (eq >= 0) {
+                qmap[URLDecoder.decode(pair.substring(0, eq), "UTF-8")] =
+                    URLDecoder.decode(pair.substring(eq + 1), "UTF-8")
+            } else {
+                qmap[URLDecoder.decode(pair, "UTF-8")] = ""
+            }
+        }
+    }
+    Map reqParams = [uri: base, contentType: "text/plain",
+                     headers: ["Accept": "application/json"], timeout: timeoutSec]
+    if (qmap) reqParams.query = qmap
+
+    Object parsed = null
+    httpGet(reqParams) { resp ->
+        String body
+        def d = resp.data
+        if (d == null) {
+            body = ""
+        } else if (d instanceof String) {
+            body = d
+        } else {
+            // Reader / InputStream / etc. — Groovy adds .text to all of them.
+            // (Deliberately no instanceof checks: the Hubitat sandbox blocks
+            // referencing java.io.Reader / InputStream as class expressions.)
+            try { body = d.text } catch (ignore) { body = d.toString() }
+        }
+        body = body?.trim() ?: ""
+
+        if (resp.status != 200) {
+            throw new Exception("HTTP ${resp.status}${body ? ' — body starts: ' + jsonErrSnippet(body) : ''}")
+        }
+        if (!body) {
+            throw new Exception("hub returned an empty response (HTTP 200)")
+        }
+        if (!(body.startsWith("{") || body.startsWith("["))) {
+            String hint = ""
+            String lower = body.toLowerCase()
+            if (lower.contains("login") || lower.contains("password")) {
+                hint = " — looks like the hub LOGIN page. Hub Login Security on that hub appears to be intercepting Maker API calls; verify the access token / app ID, or check Hub Security settings on that hub"
+            } else if (lower.startsWith("<!doctype") || lower.startsWith("<html")) {
+                hint = " — hub returned an HTML page instead of JSON. Verify Maker API is still installed/enabled on that hub and the app ID + token are correct (open the URL in a browser to see the page)"
+            }
+            throw new Exception("non-JSON response (HTTP 200)${hint}. Body starts: ${jsonErrSnippet(body)}")
+        }
+        parsed = new groovy.json.JsonSlurper().parseText(body)
+    }
+    return parsed
+}
+
+// First ~160 chars of a response body, whitespace-collapsed and HTML-escaped
+// so it displays safely inside the red warning banner.
+private String jsonErrSnippet(String body) {
+    String s = body.replaceAll(/\s+/, " ")
+    if (s.length() > 160) s = s.substring(0, 160) + "…"
+    return htmlEscape(s)
+}
+
 private String htmlEscape(Object val) {
     String s = val == null ? "" : val.toString()
     return s
@@ -2165,6 +2946,16 @@ private boolean hasSwitchCapability(def caps) {
         def name = (c instanceof Map) ? (c.title ?: c.name ?: "").toString().toLowerCase()
                                       : c?.toString()?.toLowerCase() ?: ""
         name in switchCaps
+    }
+}
+
+private boolean hasContactCapability(def caps) {
+    if (!caps) return false
+    def capsList = (caps instanceof List ? caps : [caps])
+    return capsList.any { c ->
+        def name = (c instanceof Map) ? (c.title ?: c.name ?: "").toString().toLowerCase()
+                                      : c?.toString()?.toLowerCase() ?: ""
+        name == "contactsensor" || name == "contact sensor"
     }
 }
 
