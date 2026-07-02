@@ -1,21 +1,22 @@
 # Device State Monitor Multi-Hub — User Guide
 
-**App version:** 1.52  
+**App version:** 1.59  
 **Applies to:** Hubitat Elevation, same-LAN multi-hub deployments
 
 ---
 
 ## Overview
 
-Device State Monitor Multi-Hub reports device states across up to three Hubitat hubs from a single app page. It provides five live tables:
+Device State Monitor Multi-Hub reports device states across up to three Hubitat hubs from a single app page. It provides six live tables:
 
 - **ON Devices** — switch-capable devices currently reporting ON
 - **OFF Devices** — switch-capable devices currently reporting OFF
 - **Unknown State** — switch-capable devices reporting neither ON nor OFF
 - **Lock State** — explicitly selected lock devices showing their current lock state (locked/unlocked) and battery level
+- **Contact Sensors** — explicitly selected contact sensors; by default only sensors currently **open** are listed (*"N open of M monitored"*), with an option to show every selected sensor and its state
 - **Health / Activity Monitor** — any device (switch or otherwise) that is OFFLINE, INACTIVE, NOT PRESENT, DISCONNECTED, or whose last activity exceeds a configurable time threshold
 
-Above the tables, a **Hubitat Safety Monitor (HSM)** status badge shows the current intrusion arm state and any active alert.
+Above the tables, a **Hubitat Safety Monitor (HSM)** status badge shows the current intrusion arm state and any active alert. The alert display is verified against the hub itself on every Refresh (not just driven by events), and HSM on Hubs #2 and #3 can optionally be shown as well — see [Hubitat Safety Monitor (HSM) Status](#hubitat-safety-monitor-hsm-status).
 
 Device names are clickable links to their hub's device edit page. When Maker API credentials are configured, the State cell in the ON and OFF tables is clickable to toggle the device without leaving the page.
 
@@ -29,7 +30,8 @@ Hubs #2 and #3 are queried via Hubitat's built-in **Maker API** app. Perform the
 
 1. On the remote hub, go to **Apps** → **+ Add Built-In App**.
 2. Find **Maker API** and install it.
-3. Open the Maker API app. Under **Allow Access to Devices**, select every device you want to be reachable from Device State Monitor — this includes devices you want to monitor for ON/OFF state and any you want in the Health/Activity table. Only devices selected here will be visible to the app.
+3. Open the Maker API app. Under **Allow Access to Devices**, select every device you want to be reachable from Device State Monitor — this includes devices you want to monitor for ON/OFF state, contact sensors, locks, and any you want in the Health/Activity table. Only devices selected here will be visible to the app.
+   - If you plan to display this hub's **HSM status** in the report (optional, off by default), also enable the **HSM** toggle ("Allow control of HSM") in the same Maker API app — the arm state is read through Maker API's `/hsm` endpoint.
 4. Note the **App ID** shown in the Maker API page heading (e.g. *Maker API — App # 42*). You will need this number.
 5. Copy the **Access Token** shown on the same page.
 6. Note the hub's **local IP address** (visible in Hubitat's **Settings → Hub Details**, or in your router's DHCP table).
@@ -56,8 +58,9 @@ The app page is divided into two zones:
 
 **Top — live report area**
 - **Refresh Table** button — re-queries all hubs immediately and redraws all tables
-- **HSM Status** and **HSM Alert** badges (if HSM is installed)
-- The five report tables (ON, OFF, Unknown, Lock State, Health/Activity)
+- **Clear HSM Alert Display** button — appears next to Refresh only while an HSM alert is latched; clears the alert display manually (see the HSM section)
+- **HSM Status** and **HSM Alert** badges (if HSM is installed), optionally repeated for Hubs #2 and #3
+- The six report tables (ON, OFF, Unknown, Lock State, Contact Sensors, Health/Activity)
 - *Last run* timestamp
 
 **Bottom — collapsed configuration sections**
@@ -71,7 +74,7 @@ Configuration sections are hidden by default once set up, so the report tables a
 
 ## Mobile Support
 
-All five tables are designed to display correctly on both desktop and mobile browsers. Column widths and Room column visibility adjust automatically based on the actual viewport width — no manual setting is required.
+All six tables are designed to display correctly on both desktop and mobile browsers. Column widths and Room column visibility adjust automatically based on the actual viewport width — no manual setting is required.
 
 ### Responsive Column Widths
 
@@ -106,6 +109,7 @@ Hub #1 is the hub running Device State Monitor. Its devices are accessed directl
 | **Select ON-monitored devices** | Devices that appear in the ON table when their switch state is on. Accepts any switch-capable device. |
 | **Select OFF-monitored devices** | Devices that appear in the OFF table when their switch state is off. A device may be selected in both lists. |
 | **Select lock-monitored devices** | Devices that appear in the Lock State table. Uses a `capability.lock` picker. Virtual lock devices are always included regardless of the Exclude Virtual Devices setting, since these are explicit selections. |
+| **Select contact-monitored devices** | Devices that appear in the Contact Sensor table. Uses a `capability.contactSensor` picker. Like locks, these are explicit selections, so virtual devices are always included. |
 | **Toggle Command & Health Monitor Settings** | Toggle to reveal Maker API credentials for Hub #1. These are used for two purposes: (1) clickable State cells in the ON/OFF tables and embedded toggle buttons in the Unknown table; (2) the Load / Select All / Clear All actions in the health device picker. If left blank, State cells are non-interactive and health selection reverts to a manual capability picker. |
 | **Hub #1 Health Device List Actions** | Appears once Maker API credentials are entered. Choose **⟳ Load / Reload** to fetch the device list, then **✓ Select All** or **✗ Clear** to bulk-manage health selections. |
 | **Select health/activity-monitored devices** | The capability picker — always visible. Devices selected here appear in the Health/Activity table when flagged. Disabled devices are automatically excluded. |
@@ -128,7 +132,7 @@ Toggle **Enable Hub #2?** (or #3) to on. The connection settings expand automati
 | **Hub IP address** | Local LAN IP of the remote hub (e.g. 192.168.1.100). |
 | **Maker API app ID** | The number shown in the Maker API app heading on the remote hub. |
 | **Maker API access token** | The token from the Maker API app on the remote hub. |
-| **Last load status** | Shown in green (OK) or red (error) after a Load/Reload action. Displays counts of switch and lock devices loaded, enabled devices, and disabled devices detected. |
+| **Last load status** | Shown in green (OK) or red (error) after a Load/Reload action. Displays counts of switch, lock, and contact sensor devices loaded, enabled devices, and disabled devices detected. |
 
 ### Actions Dropdown
 
@@ -143,16 +147,20 @@ All bulk device management for remote hubs is done through the **Actions** dropd
 | **✗ Clear OFF-monitored devices** | Removes all OFF monitoring selections. |
 | **✓ Select All lock-monitored devices** | Selects all lock-capable devices for lock state monitoring. |
 | **✗ Clear lock-monitored devices** | Removes all lock monitoring selections. |
+| **✓ Select All contact-monitored devices** | Selects all contact-sensor devices for contact state monitoring. |
+| **✗ Clear contact-monitored devices** | Removes all contact monitoring selections. |
 | **✓ Select All health-monitored devices** | Selects all devices (switch and non-switch) for health/activity monitoring. |
 | **✗ Clear health-monitored devices** | Removes all health monitoring selections. |
 
 ### Device Pickers
 
-After loading, four pickers appear:
+After loading, five pickers appear:
 
 **Switch Device Selection** — shows only switch-capable devices. Use the **Filter by name or room** field to narrow a long list. The ON-monitored and OFF-monitored pickers each show the count of devices available in the loaded list.
 
 **Lock Device selector** — shows only lock-capable devices exposed to the Maker API. Select the devices whose lock state you want to appear in the Lock State table.
+
+**Contact sensor selector** — shows only contact-sensor devices exposed to the Maker API. Select the sensors you want in the Contact Sensor table. *(Upgrading from a version before 1.56? Run **⟳ Load / Reload Device List** once to populate this selector.)*
 
 **Health / Activity device selector** — shows all devices exposed to the Maker API, not just switch-capable ones, so you can monitor sensors, remotes, and other non-switch devices for activity.
 
@@ -204,6 +212,25 @@ The table also includes a **Battery %** column showing the current battery level
 
 The table can be hidden in Sort & Display Options. It is sortable by Device Name, Room, Hub, Lock State, or Battery %. Virtual lock devices (e.g. Virtual Lock driver) are always shown regardless of the **Exclude virtual devices** setting, because they are individually hand-picked rather than bulk-selected.
 
+### Contact Sensor Table
+
+Lists explicitly selected contact sensors. Selection works exactly like locks:
+
+- **Hub #1** — use the **Select contact-monitored devices** capability picker in the Hub #1 section.
+- **Hubs #2 and #3** — use the **Contact sensor selector** that appears after running Load / Reload.
+
+By default the table lists **only sensors currently open**, with a heading of the form *Open Contact Sensors: 2 open of 14 monitored* — or *None open* in green when everything is closed. Turn off **Show only sensors currently OPEN?** in Sort & Display Options to list every selected sensor with its state instead.
+
+| Contact State | Display |
+|---|---|
+| **open** | Red, bold |
+| **closed** | Green, bold |
+| **unknown** or other | Gray |
+
+A **Battery %** column uses the same color coding as the Lock State table: green ≥ 40 %, orange 20–39 %, red < 20 %; sensors with no battery attribute report *n/a*.
+
+The table can be hidden in Sort & Display Options and is sortable by Device Name, Room, Hub, Contact State, or Battery %. As with locks, virtual devices are always shown because the sensors are individually hand-picked.
+
 ### Health / Activity Monitor Table
 
 Lists any health-monitored device that meets one or more of:
@@ -239,7 +266,7 @@ The table contains the following columns, all independently hideable via the Hid
 
 ## Hubitat Safety Monitor (HSM) Status
 
-When HSM is installed on Hub #1, two status lines appear above the report tables on every Refresh.
+When HSM is installed on Hub #1, two status lines appear above the report tables on every Refresh. HSM on Hubs #2 and #3 can optionally be shown as well (see [Remote HSM](#remote-hsm--hubs-2-and-3) below). When any remote HSM display is enabled, every HSM line is labeled with its hub's friendly name.
 
 ### HSM Status
 
@@ -253,10 +280,10 @@ Shows the current intrusion arm state as a color-coded badge:
 | **Arming Home…** | Orange | Exit delay in progress before Armed Home activates |
 | **Armed Night** | Purple | Intrusion alerts armed for Night mode |
 | **Arming Night…** | Purple | Exit delay in progress before Armed Night activates |
-| **Disarmed** | Green | Intrusion alerts disarmed |
-| **All Disarmed** | Green | Intrusion, smoke, water, and custom rule alerts all disarmed |
+| **Intrusion Disarmed** | Green | Intrusion alerts disarmed — smoke/water/custom monitoring remains armed |
+| **All Monitoring Disarmed** | Green | Intrusion, smoke, water, and custom rule alerts all disarmed |
 
-> **Note:** `hsmStatus` only reflects the intrusion arm state. Smoke and water monitoring rules are armed separately via HSM's internal rule engine and do not change `hsmStatus`. The badge may therefore show **Disarmed** even when smoke/water rules are active — this is a Hubitat platform limitation, not a bug.
+> **Note:** `hsmStatus` only reflects the intrusion arm state. Smoke, water, and custom monitoring rules stay armed even while intrusion is disarmed, until *All Monitoring* is disarmed. The badge therefore reads **Intrusion Disarmed** with an inline reminder that smoke/water/custom monitoring remains armed — matching the hub UI's own "Intrusion Disarmed, Water/Smoke/Gas/CO Armed" wording. There is no queryable arm state for smoke/water specifically; this is a Hubitat platform limitation.
 
 ### HSM Alert
 
@@ -270,12 +297,34 @@ Shows the most recent active alert, or **No current alert** in green when none i
 | `smoke` | SMOKE |
 | `water` | WATER LEAK |
 | `rule` | CUSTOM RULE |
+| *(poll-detected)* | ACTIVE ALERT |
 
-The app subscribes to Hubitat's `hsmAlert` location event and stores the active alert in app state. When HSM cancels the alert, the `cancel` event automatically clears the stored value and the badge returns to **No current alert** on the next Refresh.
+For custom rule alerts, the rule's name is appended to the label (e.g. *CUSTOM RULE — Door Locks unlocked*), along with the time the alert was first seen.
 
-> **Important:** After installing or updating to version 1.52, open the app and click **Done** once to register the `hsmAlert` subscription. Without this step the handler will not be active until the next hub reboot or app save.
+**How alerts are tracked.** Two mechanisms work together:
 
-The HSM badges can be hidden via the **Show HSM status above the tables?** toggle in Sort & Display Options.
+1. **Events (instant).** The app subscribes to Hubitat's `hsmAlert` location event. Both of HSM's cancellation values are honored — plain `cancel` (intrusion/smoke/water alerts) and `cancelRuleAlerts` (custom rule alerts). Transient `arming` / `armingHome` / `armingNight` notices are ignored rather than latched as alerts.
+2. **Verification (every Refresh — recommended, on by default).** HSM offers no query API for alerts, so a single missed event would otherwise leave the badge wrong until the next event. When **Verify the HSM alert state against the hub on every refresh?** is enabled, each Refresh also reads the hub's own pages and reconciles the badge with reality:
+   - With the **HSM app ID** configured (the number in HSM's URL, e.g. `/installedapp/configure/2`), the live alert text is read straight from the HSM app page — a missed alert appears as *ACTIVE ALERT — Custom Rule Alert: Door Locks unlocked*.
+   - Without it, the hub's Apps list is scanned for the red **ALERT!** suffix HSM appends to its own app label while alerting (alert presence only, no detail).
+   - Missed alerts are detected and displayed; stale alerts are auto-cleared. A footnote under the badge reports whether verification succeeded on that refresh.
+   - Verification requires **Hub Login Security to be OFF** on Hub #1. If the pages can't be read, an orange note appears and the badge falls back to event-only behavior.
+
+**Clear HSM Alert Display button.** Whenever an alert is latched, this button appears next to **Refresh Table** as a manual escape hatch (e.g. if verification is disabled and a cancel event was missed). The button and the alert badge always agree within the same refresh.
+
+Because Hubitat app pages never update spontaneously while open, a new alert (or its clearing) becomes visible on the next **Refresh Table** click or page load — never while the page simply sits idle.
+
+> **Important:** After installing or updating the app code, open the app and click **Done** once so subscriptions and settings re-initialize.
+
+### Remote HSM — Hubs #2 and #3
+
+HSM status and alerts for the remote hubs can be displayed under Hub #1's badge. This is **off by default** — enable it per hub in Sort & Display Options (**Also show HSM status for Hub #2 / #3?**).
+
+- **Status** is fetched from the remote hub's Maker API `/hsm` endpoint using the credentials already configured for that hub. This requires the **HSM** toggle ("Allow control of HSM") to be enabled inside that hub's Maker API app; until it is, the badge shows *Unavailable* with a hint.
+- **Alerts** use the same page verification as Hub #1, pointed at the remote hub's IP. Configure the optional **Hub #2/#3 HSM app ID** (the number in HSM's URL *on that hub*) to get live alert text; otherwise the remote Apps list is scanned for the **ALERT!** label. Requires Hub Login Security OFF on the remote hub — otherwise the alert line shows *Not verified* with a note.
+- **Remote alerts are poll-only.** Hubitat location events do not cross hubs, so there is no event path from remote HSMs — remote alert lines are marked *(poll-only — updates on each refresh)* and appear/clear on each Refresh, which is when the report updates anyway.
+
+The HSM badges can be hidden entirely via the **Show HSM status above the tables?** toggle in Sort & Display Options.
 
 ---
 
@@ -309,6 +358,7 @@ Each table has independent **Sort by** and **Order** controls. The sort applied 
 **ON / OFF tables:** sortable by Device Name, Room, or Hub.  
 **Unknown State table:** same columns.  
 **Lock State table:** sortable by Device Name, Room, Hub, Lock State, or Battery %.  
+**Contact Sensor table:** sortable by Device Name, Room, Hub, Contact State, or Battery %.  
 **Health / Activity table:** sortable by Device Name, Room, Hub, HE Status, or Last Activity.
 
 ### Show/Hide Tables
@@ -317,6 +367,8 @@ Each table has independent **Sort by** and **Order** controls. The sort applied 
 |---|---|
 | **Show Unknown State table?** | Hides or shows the Unknown table. Default: on. |
 | **Show Lock State table?** | Hides or shows the Lock State table. Default: on. |
+| **Show Contact Sensor table?** | Hides or shows the Contact Sensor table. Default: on. |
+| **Show only sensors currently OPEN?** | When on (default), the Contact Sensor table lists only open sensors; when off, all selected sensors appear with their state. |
 | **Show Health/Activity Monitor table?** | Hides or shows the Health table. Default: on. |
 
 ### Activity Threshold
@@ -327,14 +379,17 @@ Each table has independent **Sort by** and **Order** controls. The sort applied 
 
 | Control | Effect |
 |---|---|
-| **Exclude virtual devices** | Omits virtual devices from the ON, OFF, Unknown, and Health/Activity tables. "Virtual" is identified by driver type name containing "virtual", or device name starting with "VD " (a naming convention for virtual devices). Lock devices are exempt — they are always shown regardless of this setting because they are individually selected rather than bulk-included. |
-| **Exclude devices in the "System" room** | Omits devices assigned to the Hubitat room named "System" from all five tables. |
+| **Exclude virtual devices** | Omits virtual devices from the ON, OFF, Unknown, and Health/Activity tables. "Virtual" is identified by driver type name containing "virtual", or device name starting with "VD " (a naming convention for virtual devices). Lock and contact sensor devices are exempt — they are always shown regardless of this setting because they are individually selected rather than bulk-included. |
+| **Exclude devices in the "System" room** | Omits devices assigned to the Hubitat room named "System" from all tables. |
 
 ### Display Options
 
 | Control | Effect |
 |---|---|
 | **Show HSM status above the tables?** | Shows or hides the HSM Status and HSM Alert badges at the top of the report area. Default: on. Has no effect if HSM is not installed. |
+| **Verify the HSM alert state against the hub on every refresh?** | Cross-checks the alert badge against the hub's own pages on each Refresh — detects missed alerts and auto-clears stale ones. Default: on. Requires Hub Login Security OFF on Hub #1. See the HSM section. |
+| **HSM app ID** | Optional but recommended — the number in HSM's URL (e.g. `/installedapp/configure/2`). When set, live alert text is read straight from the HSM app page. |
+| **Also show HSM status for Hub #2 / #3?** | Per-hub toggles (shown only for enabled hubs) that add that hub's HSM status and alert lines under Hub #1's. Default: off. Each reveals an optional per-hub HSM app ID field. See [Remote HSM](#remote-hsm--hubs-2-and-3). |
 | **Show extra details in section headers?** | Appends monitored device counts to each hub section header (e.g. "Hub #3 – Office — 15 ON / 15 OFF / 4 Lock / 47 Health monitored"). |
 | **Enable debug logging?** | Writes detailed log entries to the Hubitat log for each device checked during a refresh. Useful for diagnosing missing or incorrect data. Disable when not troubleshooting — it generates a large number of log entries for hubs with many selected devices. |
 
@@ -344,8 +399,8 @@ Eight toggle buttons at the bottom of Sort & Display Options control column visi
 
 | Button | Applies to | Columns hidden |
 |---|---|---|
-| **Room** | All five tables | Room column |
-| **Hub** | All five tables | Hub column |
+| **Room** | All six tables | Room column |
+| **Hub** | All six tables | Hub column |
 | **HE Status** | Health / Activity table | HE Status column |
 | **Health Status** | Health / Activity table | Health Status column |
 | **Last Activity** | Health / Activity table | Last Activity column |
@@ -368,17 +423,20 @@ A collapsible **Notes / User Guide** section appears below Sort & Display Option
 ## Typical First-Time Setup Sequence
 
 1. Install the app on Hub #1 via **Apps → + Add User App**.
-2. Open the app. The five report tables appear (empty) and configuration sections are below.
-3. Expand **Hub #1**. Set a friendly label. Select devices for ON, OFF, lock, and health monitoring.
+2. Open the app. The six report tables appear (empty) and configuration sections are below.
+3. Expand **Hub #1**. Set a friendly label. Select devices for ON, OFF, lock, contact, and health monitoring.
 4. To enable clickable State cells and health Select All/Clear All on Hub #1: toggle **Show / Edit Toggle Command & Health Monitor Settings**, enter Maker API credentials for Hub #1, then use the **Hub #1 Health Device List Actions** dropdown to Load and Select All.
-5. For each remote hub: expand its section, toggle **Enable**, expand **Connection Settings**, enter IP/App ID/Token, collapse Connection Settings, then choose **⟳ Load / Reload Device List** from the Actions dropdown. After loading, use Select All actions and adjust individual selections as needed (including lock devices).
+5. For each remote hub: expand its section, toggle **Enable**, expand **Connection Settings**, enter IP/App ID/Token, collapse Connection Settings, then choose **⟳ Load / Reload Device List** from the Actions dropdown. After loading, use Select All actions and adjust individual selections as needed (including lock and contact sensor devices).
 6. Expand **Sort & Display Options**. Set activity threshold, sort preferences, and filtering options. Use **Hide Columns** to control which columns appear on desktop — Room and Hub apply to all tables; the six Health-specific buttons apply to the Health table only. Room visibility on phones is managed automatically by orientation (see Mobile Support).
-7. Click **Refresh Table** at the top of the page to run the first full report.
-8. Click **Done** to save.
+7. *(Optional)* In Sort & Display Options, set the **HSM app ID** for live alert text on Hub #1, and enable **Also show HSM status for Hub #2 / #3** if those hubs run HSM (remember to enable the HSM toggle in their Maker API apps).
+8. Click **Refresh Table** at the top of the page to run the first full report.
+9. Click **Done** to save.
 
 ---
 
 ## Maintenance
+
+**Upgrading the app code:** Paste the new version over the existing app code (Apps Code → open the app → replace → Save), then open the app instance and click **Done** once so subscriptions and settings re-initialize. When upgrading across version 1.56, run **⟳ Load / Reload Device List** on each remote hub once to populate the new contact sensor selector.
 
 **Adding devices to a remote hub's report:** Add the device in the remote hub's Maker API app, then run **⟳ Load / Reload** from the Actions dropdown. The new device will appear in the pickers.
 
