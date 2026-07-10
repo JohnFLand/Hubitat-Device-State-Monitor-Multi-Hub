@@ -1,13 +1,13 @@
 # Device State Monitor Multi-Hub — User Guide
 
-**App version:** 1.59  
+**App version:** 1.77  
 **Applies to:** Hubitat Elevation, same-LAN multi-hub deployments
 
 ---
 
 ## Overview
 
-Device State Monitor Multi-Hub reports device states across up to three Hubitat hubs from a single app page. It provides six live tables:
+Device State Monitor Multi-Hub reports device states across up to three Hubitat hubs from a single app page. It provides seven live tables:
 
 - **ON Devices** — switch-capable devices currently reporting ON
 - **OFF Devices** — switch-capable devices currently reporting OFF
@@ -15,10 +15,11 @@ Device State Monitor Multi-Hub reports device states across up to three Hubitat 
 - **Lock State** — explicitly selected lock devices showing their current lock state (locked/unlocked) and battery level
 - **Contact Sensors** — explicitly selected contact sensors; by default only sensors currently **open** are listed (*"N open of M monitored"*), with an option to show every selected sensor and its state
 - **Health / Activity Monitor** — any device (switch or otherwise) that is OFFLINE, INACTIVE, NOT PRESENT, DISCONNECTED, or whose last activity exceeds a configurable time threshold
+- **Rules with Private Boolean FALSE** — Rule Machine and Button Controller rules on the scanned hubs whose Private Boolean is currently FALSE, with clickable PB State cells to set a rule's Private Boolean TRUE (and back) without leaving the page — see [Rules with Private Boolean FALSE Table](#rules-with-private-boolean-false-table)
 
 Above the tables, a **Hubitat Safety Monitor (HSM)** status badge shows the current intrusion arm state and any active alert. The alert display is verified against the hub itself on every Refresh (not just driven by events), and HSM on Hubs #2 and #3 can optionally be shown as well — see [Hubitat Safety Monitor (HSM) Status](#hubitat-safety-monitor-hsm-status).
 
-Device names are clickable links to their hub's device edit page. When Maker API credentials are configured, the State cell in the ON and OFF tables is clickable to toggle the device without leaving the page.
+Device names are clickable links to their hub's device edit page; rule names in the Private Boolean table link to the rule's configuration page on its hub. When Maker API credentials are configured, the State cell in the ON and OFF tables is clickable to toggle the device without leaving the page.
 
 ---
 
@@ -58,14 +59,16 @@ The app page is divided into two zones:
 
 **Top — live report area**
 - **Refresh Table** button — re-queries all hubs immediately and redraws all tables
+- **Scan PB FALSE Rules** button — appears next to Refresh when the Private Boolean FALSE table is enabled for at least one hub; starts a new PB scan on demand
 - **Clear HSM Alert Display** button — appears next to Refresh only while an HSM alert is latched; clears the alert display manually (see the HSM section)
+- ***Last run* timestamp** — directly under the buttons, showing the report time and total scan time with a data-collection / render breakdown. (It sits at the top so it is not mistaken for a PB-scan timestamp; the PB table has its own *Last completed scan* line.)
 - **HSM Status** and **HSM Alert** badges (if HSM is installed), optionally repeated for Hubs #2 and #3
-- The six report tables (ON, OFF, Unknown, Lock State, Contact Sensors, Health/Activity)
-- *Last run* timestamp
+- The seven report tables (ON, OFF, Unknown, Lock State, Contact Sensors, Health/Activity, Rules with Private Boolean FALSE)
+- A second **Refresh Table** button (and **Scan PB FALSE Rules** button, when enabled) below the tables, so a refresh is one click away after scrolling through a long report
 
 **Bottom — collapsed configuration sections**
 - Hub #1, Hub #2, Hub #3 settings (each collapsible)
-- Sort & Display Options (sort defaults, Hide Columns, filtering, display preferences)
+- Sort & Display Options (sort defaults, Private Boolean table settings, Hide Columns, filtering, display preferences)
 - Notes / User Guide (condensed in-app reference)
 
 Configuration sections are hidden by default once set up, so the report tables are the first thing you see on every visit.
@@ -74,7 +77,7 @@ Configuration sections are hidden by default once set up, so the report tables a
 
 ## Mobile Support
 
-All six tables are designed to display correctly on both desktop and mobile browsers. Column widths and Room column visibility adjust automatically based on the actual viewport width — no manual setting is required.
+All seven tables are designed to display correctly on both desktop and mobile browsers. Column widths and Room column visibility adjust automatically based on the actual viewport width — no manual setting is required.
 
 ### Responsive Column Widths
 
@@ -246,7 +249,9 @@ Lists any health-monitored device that meets one or more of:
 
 The **Issue** column may contain multiple reasons separated by commas if more than one condition applies.
 
-For child devices (e.g. individual endpoints of a USB switch hub), last activity is resolved from the parent device if the child has no activity record of its own.
+For child devices (e.g. individual endpoints of a USB switch hub), last activity is resolved from the parent device if the child has no activity record of its own. On Hub #1 this parent lookup goes through Hub #1's own Maker API, using the same credentials configured for toggle links — without them, the fallback is skipped (with a single info log entry) and the child is evaluated on its own record.
+
+If a hub's per-device health checks start failing (e.g. its Maker API stops responding mid-refresh), a circuit breaker marks that hub as not responding after three consecutive failures and skips the remaining checks, replacing a long cascade of per-device warnings with one actionable log entry.
 
 The table contains the following columns, all independently hideable via the Hide Columns toggle bar:
 
@@ -255,12 +260,47 @@ The table contains the following columns, all independently hideable via the Hid
 | **Device Name** | Clickable link to the device edit page |
 | **Room** | Room the device is assigned to |
 | **Hub** | Friendly hub label |
+| **Issue** | Summary of the condition(s) that caused the device to appear in this table |
 | **HE Status** | Hubitat's reported device status (OFFLINE, INACTIVE, NOT PRESENT, DISCONNECTED, ACTIVE, etc.) — shown in red when problematic |
 | **Health Status** | Value of the device's `healthStatus` attribute — green for online, red for offline |
 | **Last Activity** | Timestamp of the most recent device event, color-coded by age |
-| **Issue** | Summary of the condition(s) that caused the device to appear in this table |
 | **Battery %** | Current battery level — green ≥ 40 %, orange 20–39 %, red < 20 % |
 | **Last Battery** | Timestamp of the last battery report |
+
+### Rules with Private Boolean FALSE Table
+
+*(New in 1.60, extended through 1.74.)* Lists Rule Machine and Button Controller child rules whose current **Private Boolean is FALSE**, plus any rules that remained **UNKNOWN** after read retries. It appears immediately after the Health / Activity table.
+
+| Column | Description |
+|---|---|
+| **Rule** | Clickable link to the rule's configuration page on its hub. Hubitat status suffixes (e.g. *(Required Expression false)*) are shown with their original coloring. |
+| **App Type** | RM (Rule Machine) or BC (Button Controller) |
+| **Hub** | Friendly hub label |
+| **PB State** | FALSE in red, TRUE in blue, UNKNOWN in orange — clickable where supported (see below) |
+| **Last Run** | The rule's last run time, or *Never / unavailable* |
+
+The table heading reports the live FALSE count (and an UNKNOWN count when applicable), and a summary line below it shows how many RM/BC rules were scanned across how many hubs, plus the time and duration of the last completed scan.
+
+#### Which hubs are scanned
+
+Three per-hub controls in Sort & Display Options — **Show Rules with Private Boolean FALSE table for Hub 1 / 2 / 3** — select which hubs are **scanned and displayed**. An unchecked hub receives no discovery request and no per-rule status reads, so a Hub 1-only scan spends no time on Hubs 2 or 3. Hubs #2/#3 must also be enabled normally. Turning a hub's control off hides its cached rows immediately; run **Scan PB FALSE Rules** after changing hub selections to rebuild the cache from only the selected hubs.
+
+PB scanning reads Hubitat's internal app/status pages (remote hubs via their configured IP), so it requires **Hub Login Security to be OFF** on each scanned hub.
+
+#### How scanning works
+
+- Scans run **asynchronously** with a six-minute watchdog, so hundreds of rules do not hold the app page open. While a scan is running, the previous completed results remain visible and the page auto-polls every 30 seconds until the scan finishes.
+- Start a scan with either **Scan PB FALSE Rules** button; a scan also starts automatically after clicking **Done** and on the first page open after installing/upgrading (when at least one hub's PB control is enabled).
+- Rule status is read strictly **one rule at a time** across all selected hubs. An unreadable rule is retried up to three times; if it still cannot be read, it is published as **UNKNOWN** with its linked rule name available for manual inspection — known FALSE results from the same scan remain visible. Read failures are never mis-reported as FALSE.
+- A successful read with no stored Private Boolean is correctly treated as FALSE (Rule Machine's default).
+
+#### Clickable PB State cells
+
+Click a **FALSE** cell to set that rule's Private Boolean **TRUE**. The cell turns into a blue clickable **TRUE** and the row *remains listed until the next PB scan*, so the click can be undone — clicking the TRUE cell sets the rule's Private Boolean back FALSE. Setting FALSE is deliberately possible only for rows this table itself set TRUE, so arbitrary rules can never be driven FALSE from here. A footnote below the table notes when changed rows are being retained.
+
+- **Hub #1 rules** act directly through Rule Machine's `RMUtils` (RM 5.0) on the local hub. This uses a small self-enabling OAuth endpoint in the app; if the endpoint is inactive, an orange note appears — re-open or re-save the app (or enable OAuth manually in Apps Code).
+- **Hub #2/#3 rules** become clickable once that hub's **Private Boolean Manager** (1.52+) app ID and OAuth access token are entered in the PB table settings (Sort & Display Options — the inline instructions explain where to find both on that hub). The click is relayed **server-side from Hub #1** to PBM's `/setPB` endpoint on the remote hub, and the change is verified: the table updates only after PBM confirms success, and transport/HTTP/credential/PBM errors surface in a browser alert and the log. Remote hubs without PBM credentials show read-only cells with a tooltip explaining how to enable click-to-set. *(Note: a successful relayed click is silent in the remote PBM's log unless PBM's debug logging is enabled.)*
+- Clicks are disabled while a PB scan is running or while another PB change is in flight, to avoid a completing scan racing a user change.
 
 ---
 
@@ -339,7 +379,7 @@ State cells are interactive in the ON, OFF, and Unknown tables when Maker API cr
 - On success, the State cell's label and color update immediately (optimistic update).
 - On failure (network error or non-200 HTTP status), a brief error indicator appears and the original state is restored.
 
-State cells are not interactive in the Health/Activity table — that table is for monitoring only.
+State cells are not interactive in the Health/Activity table — that table is for monitoring only. The Private Boolean FALSE table has its own clickable PB State cells with different mechanics (OAuth callback on Hub #1, Private Boolean Manager relay for remote hubs) — see [Rules with Private Boolean FALSE Table](#rules-with-private-boolean-false-table).
 
 ---
 
@@ -359,7 +399,8 @@ Each table has independent **Sort by** and **Order** controls. The sort applied 
 **Unknown State table:** same columns.  
 **Lock State table:** sortable by Device Name, Room, Hub, Lock State, or Battery %.  
 **Contact Sensor table:** sortable by Device Name, Room, Hub, Contact State, or Battery %.  
-**Health / Activity table:** sortable by Device Name, Room, Hub, HE Status, or Last Activity.
+**Health / Activity table:** sortable by Device Name, Room, Hub, HE Status, or Last Activity.  
+**Private Boolean FALSE table:** sortable by Rule Name, App Type, Hub, PB State, or Last Run.
 
 ### Show/Hide Tables
 
@@ -370,6 +411,8 @@ Each table has independent **Sort by** and **Order** controls. The sort applied 
 | **Show Contact Sensor table?** | Hides or shows the Contact Sensor table. Default: on. |
 | **Show only sensors currently OPEN?** | When on (default), the Contact Sensor table lists only open sensors; when off, all selected sensors appear with their state. |
 | **Show Health/Activity Monitor table?** | Hides or shows the Health table. Default: on. |
+| **Show Rules with Private Boolean FALSE table for Hub 1 / 2 / 3** | Three independent per-hub toggles. Each controls both whether that hub is **scanned** during PB scanning and whether its cached rows are **shown** in the combined table. Default: on. When all three are off, the PB table and the Scan PB FALSE Rules buttons are hidden. |
+| **Hub #2 / #3 Private Boolean Manager app ID & access token** | Optional per-hub credentials (shown when the hub is enabled and its PB control is on) that make that remote hub's PB State cells clickable — clicks are relayed to Private Boolean Manager's `/setPB` endpoint on that hub. See [Rules with Private Boolean FALSE Table](#rules-with-private-boolean-false-table). |
 
 ### Activity Threshold
 
@@ -399,12 +442,12 @@ Eight toggle buttons at the bottom of Sort & Display Options control column visi
 
 | Button | Applies to | Columns hidden |
 |---|---|---|
-| **Room** | All six tables | Room column |
-| **Hub** | All six tables | Hub column |
+| **Room** | All tables with a Room column (the PB table has none) | Room column |
+| **Hub** | All seven tables | Hub column |
+| **Issue** | Health / Activity table | Issue column |
 | **HE Status** | Health / Activity table | HE Status column |
 | **Health Status** | Health / Activity table | Health Status column |
 | **Last Activity** | Health / Activity table | Last Activity column |
-| **Issue** | Health / Activity table | Issue column |
 | **Battery %** | Health / Activity table | Battery % column |
 | **Last Battery** | Health / Activity table | Last Battery column |
 
@@ -423,20 +466,21 @@ A collapsible **Notes / User Guide** section appears below Sort & Display Option
 ## Typical First-Time Setup Sequence
 
 1. Install the app on Hub #1 via **Apps → + Add User App**.
-2. Open the app. The six report tables appear (empty) and configuration sections are below.
+2. Open the app. The seven report tables appear (empty) and configuration sections are below.
 3. Expand **Hub #1**. Set a friendly label. Select devices for ON, OFF, lock, contact, and health monitoring.
 4. To enable clickable State cells and health Select All/Clear All on Hub #1: toggle **Show / Edit Toggle Command & Health Monitor Settings**, enter Maker API credentials for Hub #1, then use the **Hub #1 Health Device List Actions** dropdown to Load and Select All.
 5. For each remote hub: expand its section, toggle **Enable**, expand **Connection Settings**, enter IP/App ID/Token, collapse Connection Settings, then choose **⟳ Load / Reload Device List** from the Actions dropdown. After loading, use Select All actions and adjust individual selections as needed (including lock and contact sensor devices).
 6. Expand **Sort & Display Options**. Set activity threshold, sort preferences, and filtering options. Use **Hide Columns** to control which columns appear on desktop — Room and Hub apply to all tables; the six Health-specific buttons apply to the Health table only. Room visibility on phones is managed automatically by orientation (see Mobile Support).
 7. *(Optional)* In Sort & Display Options, set the **HSM app ID** for live alert text on Hub #1, and enable **Also show HSM status for Hub #2 / #3** if those hubs run HSM (remember to enable the HSM toggle in their Maker API apps).
-8. Click **Refresh Table** at the top of the page to run the first full report.
-9. Click **Done** to save.
+8. *(Optional)* Review the three **Show Rules with Private Boolean FALSE table for Hub 1 / 2 / 3** controls (on by default) — only checked hubs are PB-scanned. To make remote hubs' PB State cells clickable, enter each hub's Private Boolean Manager app ID and access token. PB scanning requires Hub Login Security OFF on each scanned hub. The first PB scan starts automatically once at least one hub's PB control is enabled.
+9. Click **Refresh Table** at the top of the page to run the first full report.
+10. Click **Done** to save.
 
 ---
 
 ## Maintenance
 
-**Upgrading the app code:** Paste the new version over the existing app code (Apps Code → open the app → replace → Save), then open the app instance and click **Done** once so subscriptions and settings re-initialize. When upgrading across version 1.56, run **⟳ Load / Reload Device List** on each remote hub once to populate the new contact sensor selector.
+**Upgrading the app code:** Paste the new version over the existing app code (Apps Code → open the app → replace → Save), then open the app instance and click **Done** once so subscriptions and settings re-initialize. When upgrading across version 1.56, run **⟳ Load / Reload Device List** on each remote hub once to populate the new contact sensor selector. When upgrading across version 1.60, the Private Boolean FALSE table appears and its first scan starts automatically on the next page open (its per-hub controls default to on; a pre-1.72 single PB visibility setting is migrated to the per-hub controls automatically).
 
 **Adding devices to a remote hub's report:** Add the device in the remote hub's Maker API app, then run **⟳ Load / Reload** from the Actions dropdown. The new device will appear in the pickers.
 
@@ -444,4 +488,10 @@ A collapsible **Notes / User Guide** section appears below Sort & Display Option
 
 **Hub goes offline:** The report shows a red warning banner for that hub and omits its devices from the tables. The remaining hubs still report normally.
 
-**Refresh cadence:** The tables are only updated when you click **Refresh Table** or revisit the app page. The app does not poll on a schedule.
+**"No usable device data" warnings:** If a hub's Maker API returns a device list with no usable entries, the app treats it as a data outage rather than an empty selection — the affected fetchers stop and a visible per-hub warning names the likely cause (typically a recent platform/beta update) instead of rendering clean-but-empty tables. A genuinely empty selection still reports normally.
+
+**Deleted devices in a Maker API list:** A device that was deleted while still selected in a hub's Maker API app can appear as a literal null entry in that hub's device list. These entries are skipped automatically (with a log entry noting how many); re-save that hub's Maker API app to clean them up.
+
+**Platform compatibility:** As of 1.77 the app works on both standard firmware and the 2026 beta platform builds that hand back Maker API JSON responses pre-parsed — no rollback is required.
+
+**Refresh cadence:** The tables are only updated when you click **Refresh Table** or revisit the app page. The app does not poll on a schedule, with one exception: while a PB scan is running, the page auto-refreshes every 30 seconds until the scan completes.
