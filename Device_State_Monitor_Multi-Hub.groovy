@@ -1,11 +1,12 @@
 /*
 Device State Monitor Multi-Hub
 
-PURPOSE: Report switch device states across up to three Hubitat hubs,
-         with clickable State cells to turn devices ON or OFF instantly.
-         Also reports devices that are OFFLINE, INACTIVE, NOT PRESENT,
-         DISCONNECTED (e.g. MQTT Display Publisher),
-         or whose last activity exceeds a configurable time threshold.
+PURPOSE: Report device states across up to three Hubitat hubs, with clickable
+         State cells to turn switch devices ON or OFF instantly. Also reports
+         devices that are OFFLINE, INACTIVE, NOT PRESENT, DISCONNECTED
+         (e.g. MQTT Display Publisher), or whose last activity exceeds a
+         configurable time threshold, plus RM/BC rules whose Private Boolean
+         is currently FALSE.
 
 FEATURES:
     * Hub #1 devices queried locally. Separate ON-monitor, OFF-monitor, and
@@ -31,7 +32,16 @@ FEATURES:
     * All tables are independently sortable (click headers or Sort Options).
     * Health / Activity Monitor table is horizontally scrollable on narrow screens
       so iPhone portrait views do not squeeze columns until cells overlap.
-    * Device names link to their hub's Devices page.
+    * Private Boolean FALSE table scans RM/BC child rules across Hub #1 and
+      enabled Hubs #2/#3, lists only FALSE rules, and keeps unreadable rules
+      as unknown instead of incorrectly treating them as FALSE. FALSE state
+      cells are clickable to set that rule's Private Boolean TRUE: Hub #1
+      directly via RMUtils, Hubs #2/#3 relayed to Private Boolean Manager's
+      /setPB endpoint on that hub (requires PBM installed there plus its app
+      ID and access token in this app's PB table settings). A changed row
+      stays listed until the next PB scan and can be clicked back to FALSE.
+    * Device names link to their hub's Devices page; PB rule names link to the
+      corresponding rule configuration page.
     * Report tables and Refresh button appear at the TOP of the page;
       all configuration sections are collapsed below.
     * Refresh Table button re-queries all hubs on demand.
@@ -126,15 +136,296 @@ CHANGES IN 1.59:
       same refresh. (Note: as with all Hubitat app pages, the page itself
       only updates on a render — clicking Refresh Table or reopening the
       app — never spontaneously while it sits open.)
+
+CHANGES IN 1.60:
+    * NEW: Rules with Private Boolean FALSE table immediately after the
+      Health / Activity Monitor. Scans Rule Machine and Button Controller
+      child rules on Hub #1 and on enabled Hubs #2/#3, and lists only rules
+      whose current Private Boolean is FALSE. Columns: Rule, App Type, Hub,
+      and Last Run; the table is independently sortable and can be filtered by hub.
+    * PB-state logic follows Private Boolean Manager 1.52: a successful,
+      structurally valid statusJson read with no "private" appState entry is
+      treated as FALSE (Rule Machine's default), while HTTP / parse / malformed
+      payload failures remain unknown and are never incorrectly listed as FALSE.
+    * PB scanning runs asynchronously with a six-minute watchdog, so hundreds
+      of rules do not hold the app page open. Existing
+      PB results remain visible while a new PB scan is running. Remote PB
+      scanning uses each enabled hub's configured IP and Hubitat internal
+      app/status pages; Hub Login Security must allow those pages to be read.
+
+CHANGES IN 1.61:
+    * FIX: PB FALSE scan results were silently destroyed whenever the async
+      scan chain finished while a page render was still in flight. Hubitat
+      loads an app's entire state map at the start of each execution and
+      writes the whole map back at the end, so a mainPage render that began
+      before finalizePbFalseScan() committed would overwrite pbFalseRowsJson
+      (and every other PB state key) with its stale pre-scan snapshot. The
+      page then saw rowsJson == null with no active scan, auto-restarted the
+      scan, and the ~6-second render again outlived the fast localhost scan —
+      an endless "PB scan in progress… / No rules." loop. (Private Boolean
+      Manager never hit this because its page render is cheap and its scans
+      take minutes, so a render commit never landed after scan finalize.)
+    * Scan results are now ALSO stored in a @Field static map
+      (pbFinalizedResults), which is immune to state-snapshot overwrites.
+      Every mainPage render read-repairs state from that map before deciding
+      whether a scan is needed, so a clobbered state commit self-heals on the
+      next render/poll instead of triggering a rescan.
+    * Discovery warnings are carried in the finalized-results map as well, so
+      they survive regardless of which execution's state commit wins.
+
+CHANGES IN 1.62:
+    * FIX: formatPbScanDuration() crashed with "Ambiguous method overloading
+      for method java.lang.Math#max ... [Long, BigDecimal]" at the end of
+      EVERY scan. Groovy's '/' on two longs returns a BigDecimal, and
+      Math.max(Long, BigDecimal) has no unambiguous overload. Because the
+      crash happened inside finalizePbFalseScan() (called from the last
+      status callback and from the watchdog), results were never written and
+      pbCurrentScanId was never cleared — the table stayed at "PB scan in
+      progress… / No rules." forever and all restart attempts were ignored
+      as duplicate starts. Now uses intdiv() (pure long math). This was the
+      primary cause of the missing table in 1.60/1.61; the state-snapshot
+      race fixed in 1.61 was a secondary hazard.
+    * HARDENING: finalizePbFalseScan() now clears the transient scan statics
+      in a finally block and surfaces any finalize exception via
+      pbFalseLastError, so no future finalize failure can wedge the scan in
+      a permanent "in progress" state.
+
+CHANGES IN 1.63:
+    * NEW: Added a PB State column to the Rules with Private Boolean FALSE
+      table. Hub #1 FALSE cells are clickable; clicking FALSE uses the
+      documented Rule Machine RMUtils action setRuleBooleanTrue (RM 5.0),
+      briefly shows TRUE, then removes the row because it no longer belongs
+      in the FALSE-only table. The cached finalized PB result is updated at
+      the same time so the row stays gone on a normal page refresh.
+    * PB toggling is deliberately limited to Hub #1. RMUtils acts on Rule
+      Machine on the hub running this app and has no remote-hub target
+      parameter. Remote Hub #2/#3 rows therefore show their actual FALSE
+      state but are non-clickable, avoiding any chance of changing a local
+      rule that happens to have the same numeric app ID.
+    * PB state clicks are disabled while a PB scan is active to avoid a
+      completed scan racing a user change and reintroducing stale FALSE rows.
+    * Added a small self-enabling OAuth endpoint, following Private Boolean
+      Manager 1.52, so the in-table browser click can safely call back into
+      this app and invoke RMUtils on Hub #1.
+
+CHANGES IN 1.64:
+    * FIX: PB table rule names no longer display Hubitat's embedded color-span
+      markup as literal HTML text (for example, <span style='color:red'>...
+      </span>). Rule names are now fully HTML-escaped first, then only the
+      tightly restricted color-span pattern already used by Private Boolean
+      Manager is restored for display. This preserves Hubitat status suffixes
+      such as "(Required Expression false)" as colored text without allowing
+      arbitrary rule-name HTML to be injected into the report. Existing cached
+      PB rows render correctly immediately; no PB rescan is required.
+
+CHANGES IN 1.65:
+    * NEW: Replaced the single PB FALSE table visibility control with three
+      per-hub controls: "Show Rules with Private Boolean FALSE table for Hub 1",
+      Hub 2, and Hub 3. The single PB table now filters its cached rows to the
+      selected hub(s). PB scanning still collects all configured/enabled hubs,
+      so changing only the display controls does not require a rescan.
+    * Legacy showPbFalseTable is used as a fallback only until each new per-hub
+      setting is saved, preserving the prior visibility choice on upgrade.
+
+CHANGES IN 1.66:
+    * CHANGED: The three per-hub PB FALSE controls now select which hubs are
+      actually scanned, not merely which cached rows are displayed. Hub #1 is
+      discovered/scanned only when its PB control is enabled. Hubs #2/#3 are
+      discovered/scanned only when both their PB control and the hub itself are
+      enabled. Unselected hubs receive no Apps-list discovery request and no
+      per-rule statusJson requests, avoiding PB work on hubs that are not selected.
+    * The combined PB FALSE table still filters cached rows by the same controls,
+      so disabling a hub hides its old cached rows immediately; the next PB scan
+      replaces the cache with results from only the selected hubs.
+
+CHANGES IN 1.67-1.70: Internal concurrency experiments, superseded by 1.71.
+
+CHANGES IN 1.71:
+    * Current PB state is read strictly one rule at a time across all selected
+      hubs. An unreadable rule is retried up to three attempts; if it is still
+      unreadable, it is published as UNKNOWN with its linked rule name available
+      for manual inspection, and known FALSE results from the same completed
+      scan remain available.
+    * The per-hub PB scan selectors, clickable Hub #1 FALSE-to-TRUE state cells,
+      safe rule-name HTML rendering, clobber-resistant finalized-result cache, and
+      FALSE/UNKNOWN table behavior are unchanged.
+
+CHANGES IN 1.72:
+    * CLEANUP: Removed dead code left over from earlier scan designs: the
+      write-only state.pbFalseScanTotal key (also removed from existing installs
+      on the next Done), the unused findPbRuleBaseUrl() helper and the baseUrl
+      entry it populated, the duplicate pbScanSequentialQueue static (the scan
+      uses one rule queue), and the vestigial pbScanPhase static and its guards
+      (pbCurrentScanId alone identifies an active scan).
+    * RENAMED for clarity: PB_STATUS_PUMP_INTERVAL_SECS is now
+      PB_STATUS_WATCHDOG_INTERVAL_SECS, PB_STATUS_VERIFY_MAX_ATTEMPTS is now
+      PB_STATUS_READ_MAX_ATTEMPTS, and finishPbVerifiedScan() is now
+      finishPbSequentialScan().
+    * FIX: FALSE cells in the PB table are now red (both clickable Hub #1 cells
+      and read-only remote-hub cells); previously both rendered in gray.
+    * FIX: In setPbFalseToTrue(), the click-busy flag was set before the
+      missing-URL guard, so an early return could permanently block all further
+      PB State clicks until a page reload. The guard now runs first.
+    * The zero-rules path and finalize now publish results through one shared
+      writer (publishPbFinalizedResults) so the two cannot drift apart, and
+      buildPbFalseTable() reads cached rows through getCachedPbFalseRows(),
+      which prefers the clobber-proof static copy.
+    * Legacy showPbFalseTable is migrated once to the per-hub PB controls
+      (any unset per-hub toggle inherits the legacy value) and the legacy
+      setting is then removed; the runtime fallback is gone.
+    * Removed a JSON-parse branch in buildPbScanResultFromResponse() that could
+      only ever throw (non-JSON, non-login-page payloads are now logged directly).
+
+CHANGES IN 1.73:
+    * NEW: Hub #2/#3 FALSE PB State cells are now clickable, using the Private
+      Boolean Manager 1.52 already installed on those hubs. Enter each remote
+      hub's PBM app ID and OAuth access token in the PB table settings (the
+      instructions beside the inputs explain where to find both). A click on a
+      remote FALSE cell calls this app's /setPbTrue endpoint as before; the app
+      then relays the request server-side from Hub #1 to PBM's documented
+      /setPB endpoint on that hub, which invokes RMUtils locally there and
+      also updates PBM's own cached PB states.
+    * The relay is synchronous and verified: the table row is removed and the
+      cached FALSE count decremented only after the remote PBM responds with
+      status success. Transport errors, HTTP errors, bad credentials, and
+      PBM-reported failures all surface in the browser alert and the log, and
+      the row remains in place.
+    * Remote hubs without PBM credentials configured keep read-only FALSE
+      cells, with a tooltip explaining how to enable click-to-set. All other
+      guards are unchanged and now hub-aware: clicks are rejected while a PB
+      scan is running or another PB change is in flight, and only rules
+      currently cached as FALSE for that specific hub can be changed.
+
+CHANGES IN 1.74:
+    * CHANGED: Clicking a FALSE PB State cell no longer removes the row.
+      The cell changes to a blue clickable TRUE and the row remains listed
+      until the next PB scan (manual, automatic, or after Done) rebuilds the
+      table from fresh results.
+    * NEW: Change-of-mind support — clicking a TRUE cell sets that rule's
+      Private Boolean back FALSE (Hub #1 via RMUtils, remote hubs relayed to
+      PBM's /setPB, which accepts both values). Setting FALSE is deliberately
+      restricted to rows this table itself set TRUE: the endpoint requires the
+      rule to be cached with the opposite state before acting, so arbitrary
+      rules can never be driven FALSE from here.
+    * The /setPbTrue endpoint is now /setPb with a value=true|false parameter;
+      removeCachedPbFalseRule() is replaced by updateCachedPbFalseRow(), which
+      updates the cached row's PB state in place and recomputes the live FALSE
+      count (the count header still counts only FALSE rows). A footnote below
+      the table notes when changed rows are being retained.
+    * NOTE: A successful relayed click is silent in the remote PBM's log by
+      design — PBM logs setPB actions only when its debug logging is enabled.
+
+CHANGES IN 1.75:
+    * FIX (latent since the health feature was added): getDeviceById() does
+      not exist in the Hubitat app sandbox, so the two call sites that used it
+      threw MissingMethodException on every call — the parent-lastActivity
+      fallback for Hub #1 child devices, and the supplementary
+      hub1SelectedHealthDevices resolution — and both silently did nothing.
+      Both now work through Hub #1's OWN Maker API: parents are fetched for
+      their lastActivity, and supplementary health IDs are checked via the
+      same code path used for Hubs #2/#3 (with links rewritten to relative
+      URLs). Requires the Hub #1 Maker API app ID and token already used for
+      Hub #1 toggle links; without them the supplementary IDs are skipped
+      with one info log instead of one debug error per device.
+    * FIX: A literal null entry in a Maker API /devices list (typically a
+      deleted device still selected in that Maker API app) aborted the whole
+      hub's switch/health query with "Cannot get property 'id' on null
+      object". fetchJson() now drops null list entries centrally, logs how
+      many were skipped, and advises re-saving that hub's Maker API app.
+    * HARDENING: The per-device health check now has a circuit breaker — three
+      consecutive failures with no successes marks the hub's Maker API as not
+      responding and skips the remaining checks, replacing the previous
+      one-warning-per-device cascade (19+ log lines per hub) with a single
+      actionable warning.
+    * The empty-response error message now names the endpoint and explains the
+      browser test and the fix (re-open that Maker API app and press Done, or
+      reboot that hub).
+
+CHANGES IN 1.76:
+    * HARDENING against a broken Maker API (observed with a 2026-07-07 beta
+      platform build that returned device lists of the correct length with
+      every element serialized as literal null, and empty bodies for
+      single-object endpoints): a device list with zero usable entries is no
+      longer treated as authoritative. Previously the health check interpreted
+      it as "every selected device is disabled or removed" and silently
+      skipped them all — rendering a clean health table during a total data
+      outage, the worst possible failure mode for a monitoring app.
+    * All four remote fetchers (switch states, locks, contacts,
+      health/activity) now stop and surface a visible per-hub warning when the
+      Maker API returns no usable device data, naming the likely cause
+      (a recent platform/beta update) instead of producing empty-but-clean
+      tables. The device-picker loaders likewise report the condition in
+      their status line and log instead of quietly loading zero devices.
+    * No behavior changes when the Maker API is healthy: a genuinely empty
+      selection still reports normally, and hubs with working APIs are
+      unaffected.
+
+CHANGES IN 1.77:
+    * ROOT CAUSE FOUND AND FIXED for the 2026-07-07 outage: it was never the
+      responding hubs' Maker APIs — it was the HTTP CLIENT on the hub running
+      this app. The beta platform build hands resp.data back to httpGet
+      callers ALREADY PARSED (a Map or List) for application/json responses,
+      regardless of the requested contentType. This app's text-fallback
+      (d.text) silently mangled parsed data: on a Map, .text is a missing key
+      → null → the "empty response (HTTP 200)" errors on every single-object
+      endpoint (/devices/<id>, /hsm, statusJson); on a List, Groovy
+      spread-collects a nonexistent 'text' property from each element → a
+      list of N nulls whose toString is "[null, null, …]" — valid JSON that
+      re-parsed into the all-null device lists with exactly-correct lengths.
+      This also explains why the non-beta Office hub "failed" identically
+      (the beta House hub was the client mangling its responses) and why a
+      browser showed correct JSON from a beta Garage hub (the server side was
+      always fine).
+    * fetchJson() now accepts pre-parsed Map/List responses directly, and
+      fetchRawText() re-serializes them to JSON text for its text-parsing
+      callers. Both helpers remain fully compatible with the pre-beta
+      behavior (String/Reader bodies), so this version works on either
+      firmware — rolling back is no longer required for this app, though the
+      1.76 no-usable-data guards remain as defense in depth.
+    * HTML endpoints (e.g. the HSM app page verification) were never affected,
+      which is why they kept working throughout — the beta change applies
+      only to application/json responses.
 */
 
+import hubitat.helper.RMUtils
+import groovy.transform.Field
+
+@Field static final String PB_RM_BASE_URL                    = "http://127.0.0.1:8080"
+@Field static final String PB_RM_VERSION                     = "5.0"
+@Field static final int    PB_SCAN_TIMEOUT_SECS              = 360
+@Field static final int    PB_STATUS_REQUEST_TIMEOUT_SECS    = 30
+@Field static final int    PB_STATUS_WATCHDOG_INTERVAL_SECS   = 5    // sequential per-request watchdog check interval
+@Field static final int    PB_STATUS_READ_MAX_ATTEMPTS        = 3
+
+// Transient PB scan state. Like Private Boolean Manager, this avoids writing
+// hundreds of intermediate rows to Hubitat's state database during a scan.
+@Field static String    pbCurrentScanId      = null
+@Field static Long      pbScanStartMs        = 0L
+@Field static List<Map> pbScanRuleQueue      = null // all selected rules, read one at a time
+@Field static Map       pbScanPartialResults = null
+@Field static Integer   pbScanSequentialIdx   = 0
+@Field static Map       pbScanSequentialAttempts = [:] // rule key -> attempts already completed
+@Field static String    pbScanSequentialActiveKey = null
+@Field static String    pbScanSequentialRequestToken = null
+@Field static Long      pbScanSequentialStartedMs = 0L
+
+// Finalized scan results, kept in a static so they cannot be clobbered by a
+// concurrent execution's whole-map state write-back (Hubitat state is a
+// snapshot committed at end of execution — last writer wins for the ENTIRE
+// map, so a slow page render can silently erase everything the async scan
+// chain wrote to state). mainPage() read-repairs state from this map.
+@Field static Map       pbFinalizedResults      = null
+@Field static List      pbScanDiscoveryWarnings = null
+@Field static String    pbToggleRuleId           = null   // serializes PB click actions against scans / other clicks
+
 definition(
-    name:         "Device State Monitor Multi-Hub 1.59",
+    name:         "Device State Monitor Multi-Hub 1.77",
     namespace:    "John Land",
     author:       "John Land via Claude AI and ChatGPT",
-    description:  "Reports ON/OFF/unknown switch states and health/activity status across up to three hubs",
-    installOnOpen: true,
-    category:     "Convenience",
+    description:  "Reports device states, health/activity, and FALSE Private Booleans across up to three hubs",
+    installOnOpen:  true,
+    oauth:          true,
+    category:       "Convenience",
     iconUrl:      "",
     iconX2Url:    "",
     importUrl:    "https://raw.githubusercontent.com/JohnFLand/Hubitat-Device-State-Monitor-Multi-Hub/refs/heads/main/Device_State_Monitor_Multi-Hub.groovy"
@@ -144,17 +435,65 @@ preferences {
     page(name: "mainPage")
 }
 
+// Local OAuth endpoint used by the clickable PB State cells. Hub #1 rules are
+// set directly via RMUtils; Hub #2/#3 rules are relayed server-side to Private
+// Boolean Manager's /setPB endpoint on that hub. Setting TRUE is allowed for
+// any rule cached as FALSE; setting FALSE is deliberately restricted to rules
+// this table itself set TRUE (cached privateBool == true), so arbitrary rules
+// cannot be driven FALSE from here.
+mappings {
+    path("/setPb") { action: [GET: "handleSetPbEndpoint"] }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // UI: MAIN PAGE
 // ─────────────────────────────────────────────────────────────────────────────
 
 def mainPage() {
+    checkOAuth()
     syncAppInstanceLabel()
-    dynamicPage(name: "mainPage", title: "<b>${htmlEscape(getAppDisplayName())}</b>", uninstall: true, install: true) {
+    migratePbLegacySettings()
+
+    // Read-repair: copy the last finalized PB scan results from the @Field
+    // static into this execution's state snapshot BEFORE deciding whether a
+    // scan is stuck or needs to be (re)started. If a prior page render's
+    // whole-map state commit clobbered the results the async chain wrote,
+    // this restores them, and this render's own end-of-execution commit
+    // persists them. Without this, rowsJson stayed null forever and every
+    // 30-second poll restarted a scan whose results were destroyed in turn.
+    syncPbFinalizedResults()
+
+    // @Field scan state is intentionally transient. If the app class was reloaded
+    // or the hub restarted mid-scan, do not leave a permanent "scan in progress"
+    // message behind after the transient scan context has disappeared.
+    if (pbCurrentScanId == null && state.pbFalseScanStatus?.toString()?.contains("scan in progress")) {
+        state.pbFalseScanStatus = state.pbFalseRowsJson
+            ? "<i>The prior PB scan was interrupted before completion. Previous completed results are shown; click Scan PB FALSE Rules to scan again.</i>"
+            : null
+    }
+
+    // On the first page open after installing/upgrading, populate the PB table
+    // automatically. UNKNOWN is now a valid published result after retries, so it
+    // does not trigger another automatic scan on every page render.
+    boolean pbNeedsInitialScan = (state.pbFalseRowsJson == null)
+    boolean pbIncompleteScanWaitingForManualRetry = state.pbFalseLastError?.toString()?.contains("Fresh results were NOT published")
+    if (anyPbFalseHubShown() && pbNeedsInitialScan && !pbIncompleteScanWaitingForManualRetry && pbCurrentScanId == null) {
+        startPbFalseScan()
+    }
+
+    // PB scans can take a minute or more on a hub with hundreds of rules. A
+    // gentle 30-second page poll updates the table when the async chain finishes
+    // without repeatedly hammering the remote device APIs every five seconds.
+    int pbPollInterval = (pbCurrentScanId != null) ? 30 : 0
+
+    dynamicPage(name: "mainPage", title: "<b>${htmlEscape(getAppDisplayName())}</b>", uninstall: true, install: true, refreshInterval: pbPollInterval) {
 
         // ── Refresh + Report (TOP) ────────────────────────────────────────────
         section(title: "") {
-            input "refresh", "button", title: "Refresh Table"
+            input "refresh", "button", title: "Refresh Table", width: 6
+            if (anyPbFalseHubShown()) {
+                input "btnScanPbFalseTop", "button", title: "Scan PB FALSE Rules", width: 6
+            }
             // Generate the report BEFORE deciding whether to show the Clear
             // button: report generation runs the HSM verification poll, which
             // can latch a newly-detected alert or auto-clear a stale one.
@@ -168,7 +507,10 @@ def mainPage() {
 
         // ── Second Refresh button (bottom of report, above config sections) ──
         section(title: "") {
-            input "refresh2", "button", title: "Refresh Table"
+            input "refresh2", "button", title: "Refresh Table", width: 6
+            if (anyPbFalseHubShown()) {
+                input "btnScanPbFalseBottom", "button", title: "Scan PB FALSE Rules", width: 6
+            }
         }
 
         // ── Hub #1 – Local ────────────────────────────────────────────────────
@@ -578,6 +920,39 @@ def mainPage() {
                     defaultValue: "asc", submitOnChange: true
             }
 
+            paragraph("<hr><b>Rules with Private Boolean FALSE Table</b><br>" +
+                      "<small><i>Each control selects whether that hub is included in the PB scan and shown in the combined table. Unchecked hubs are not queried during PB scanning.</i></small>")
+            [1, 2, 3].each { int hubNum ->
+                input "showPbFalseHub${hubNum}", "bool",
+                    title: "Show Rules with Private Boolean FALSE table for Hub ${hubNum}",
+                    defaultValue: true, submitOnChange: true
+            }
+            [2, 3].each { int hubNum ->
+                if (showPbFalseForHub(hubNum) && settings["hub${hubNum}Enabled"]) {
+                    def rLabel = settings["hub${hubNum}Label"] ?: "Hub ${hubNum}"
+                    paragraph("<small><b>Hub #${hubNum} (${rLabel}) click-to-set:</b> to make this hub's FALSE cells " +
+                              "clickable, enter its <b>Private Boolean Manager</b> app ID and OAuth access token below. " +
+                              "Open PBM on that hub: the app ID is the number in its URL " +
+                              "(<code>/installedapp/configure/&lt;app ID&gt;</code>), and its printable-report link has the form " +
+                              "<code>/apps/api/&lt;app ID&gt;/report?access_token=&lt;token&gt;</code> — copy the token from there. " +
+                              "Clicks are relayed from Hub #1 to PBM's /setPB endpoint on that hub.</small>")
+                    input "hub${hubNum}PbmAppId", "number",
+                        title: "Hub #${hubNum} Private Boolean Manager app ID",
+                        required: false, submitOnChange: true
+                    input "hub${hubNum}PbmToken", "text",
+                        title: "Hub #${hubNum} Private Boolean Manager access token",
+                        required: false, submitOnChange: true
+                }
+            }
+            if (anyPbFalseHubShown()) {
+                input "sortByPbFalse", "enum", title: "Sort by",
+                    options: ["name": "Rule Name", "appType": "App Type", "hub": "Hub", "privateBool": "PB State", "lastRun": "Last Run"],
+                    defaultValue: "name", submitOnChange: true
+                input "sortOrderPbFalse", "enum", title: "Order",
+                    options: ["asc": "Ascending", "desc": "Descending"],
+                    defaultValue: "asc", submitOnChange: true
+            }
+
             paragraph("<hr>")
             input "excludeVirtual",    "bool", title: "Exclude virtual devices from all reports (including Health/Activity table)?", defaultValue: false
             input "excludeSystemRoom", "bool", title: "Exclude devices in the \"System\" room from all reports?", defaultValue: false
@@ -634,7 +1009,7 @@ def mainPage() {
                 "across up to three Hubitat hubs from a single app page." +
 
                 "<hr><b>Page Layout</b><br>" +
-                "The <b>Refresh Table</b> button and all four report tables appear at the top of the page. " +
+                "The <b>Refresh Table</b> button and report tables appear at the top of the page. " +
                 "If HSM is installed, its current intrusion-arm status appears above the tables as a colour-coded badge. " +
                 "Active HSM alerts (intrusion, smoke, water, custom rules) are shown separately as a blinking red line — " +
                 "the app subscribes to <i>hsmAlert</i> events and stores the active alert in app state, clearing it automatically when HSM cancels the alert " +
@@ -672,6 +1047,12 @@ def mainPage() {
                 "<li><b>Health / Activity Monitor</b> — any health-monitored device that is OFFLINE, INACTIVE, NOT PRESENT, " +
                 "or whose last activity exceeds the configured threshold. Columns: Device Name, Room, Hub, HE Status, " +
                 "Issue, HE Status, Health Status, Last Activity, Battery %, Last Battery.</li>" +
+                "<li><b>Rules with Private Boolean FALSE</b> — Rule Machine and Button Controller child rules whose current " +
+                "Private Boolean is FALSE, plus any UNKNOWN exceptions that remain unreadable after retries. The scan covers only hubs selected by the three per-hub PB controls; Hubs #2/#3 must also be enabled normally. Unselected hubs are not queried. Columns are Rule, App Type, Hub, PB State, and Last Run. " +
+                "Click a FALSE PB State cell to set that rule's Private Boolean TRUE; the cell turns to a blue TRUE and the row remains listed until the next PB scan, so a click can be undone — clicking the TRUE cell sets the rule's Private Boolean back FALSE. Setting FALSE is only possible for rows this table itself set TRUE. " +
+                "Hub #1 cells act directly through Rule Machine's RMUtils on this hub. Hub #2/#3 cells become clickable once that hub's Private Boolean Manager app ID and access token are entered in the PB table settings; the click is relayed server-side from Hub #1 to Private Boolean Manager's /setPB endpoint on that hub, and the row is removed only after PBM confirms success. " +
+                "A successful rule-status read with no stored Private Boolean is correctly treated as FALSE (the RM default). Any unreadable rule is retried sequentially up to three times; if it still cannot be read, it is published as UNKNOWN with its linked rule name available for manual inspection while all known FALSE results remain visible. Remote PB scanning uses Hubitat internal app/status pages and therefore requires " +
+                "those pages to be accessible without a Hub Login Security login challenge.</li>" +
                 "</ul>" +
                 "Device names are clickable links to the device edit page. " +
                 "Devices monitored in both the ON and OFF lists are flagged with a gold star (★) and shown in orange." +
@@ -700,6 +1081,7 @@ def mainPage() {
                 "<b>Per-table sort</b> — set the default sort column and direction for each table. " +
                 "Click any column header in the live table to re-sort interactively without changing the saved default.<br>" +
                 "<b>Activity threshold</b> — devices with no recorded activity older than this many hours are flagged as Late Activity in the Health table. Default: 24h.<br>" +
+                "<b>Private Boolean FALSE table</b> — three independent controls select which hubs are scanned and shown in the combined table. An unchecked hub receives no PB Apps-list discovery request and no per-rule PB status requests, so a Hub 1-only scan spends no time scanning Hubs 2 or 3. The table also has its own saved default sort. Turning a hub off hides its cached rows immediately; run <b>Scan PB FALSE Rules</b> after changing hub selections to refresh the cache from only the selected hubs. The PB scan reads current rule status strictly one rule at a time across all selected hubs. An unreadable rule is retried sequentially up to three times; if it still cannot be read, it is published as UNKNOWN with its linked rule name available for manual inspection while all known FALSE results remain visible. The first scan starts automatically after installing/upgrading when at least one hub's PB control is enabled.<br>" +
                 "<b>Exclude virtual devices</b> — omits devices whose driver name contains \"virtual\" or whose name starts with \"VD \" from all tables.<br>" +
                 "<b>Exclude System room</b> — omits devices in the Hubitat room named \"System\" from all tables.<br>" +
                 "<b>Hide Columns</b> — eight toggle buttons control column visibility. " +
@@ -756,6 +1138,249 @@ private String getAppDisplayName() {
     return safeString(app.label ?: app.name ?: "Device State Monitor Multi-Hub")
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PRIVATE BOOLEAN CLICK ENDPOINT / OAUTH
+// Mirrors the self-enabling OAuth pattern used by Private Boolean Manager 1.52.
+// Only Hub #1 can be changed: RMUtils operates on Rule Machine on this hub.
+// ─────────────────────────────────────────────────────────────────────────────
+
+private String getAppTypeId() {
+    String typeId = null
+    try {
+        httpGet([uri: PB_RM_BASE_URL, path: "/hub2/userAppTypes", timeout: 15]) { resp ->
+            List apps = resp.data instanceof List ? (List) resp.data : []
+            Map match = apps.find { it.name == app.name }
+            if (match) typeId = match.id?.toString()
+        }
+    } catch (Exception e) {
+        if (enableLogging) log.debug "PB toggle OAuth: could not fetch user app types — ${e.message}"
+    }
+    return typeId
+}
+
+private boolean autoEnableOAuth() {
+    String typeId = getAppTypeId()
+    if (!typeId) {
+        log.warn "PB toggle OAuth: could not determine app type ID — OAuth must be enabled manually in Apps Code"
+        return false
+    }
+
+    String internalVer = null
+    try {
+        httpGet([uri: PB_RM_BASE_URL, path: "/app/ajax/code", query: [id: typeId], timeout: 15]) { resp ->
+            internalVer = resp.data?.version?.toString()
+        }
+    } catch (Exception e) {
+        log.warn "PB toggle OAuth: could not fetch app code version — ${e.message}"
+        return false
+    }
+    if (!internalVer) {
+        log.warn "PB toggle OAuth: app code version was null"
+        return false
+    }
+
+    boolean success = false
+    try {
+        httpPost([
+            uri                : PB_RM_BASE_URL,
+            path               : "/app/edit/update",
+            requestContentType : "application/x-www-form-urlencoded",
+            body               : [id: typeId, version: internalVer, oauthEnabled: "true", _action_update: "Update"],
+            timeout            : 20
+        ]) { resp ->
+            success = true
+        }
+        if (success) log.info "PB toggle OAuth enabled on app code (typeId: ${typeId})"
+    } catch (Exception e) {
+        log.warn "PB toggle OAuth: auto-enable failed — ${e.message}"
+    }
+    return success
+}
+
+boolean checkOAuth() {
+    if (state.accessToken) return true
+    try {
+        createAccessToken()
+        if (state.accessToken) {
+            log.info "Device State Monitor: OAuth token created for PB State clicks"
+            return true
+        }
+    } catch (Exception e) {
+        if (enableLogging) log.debug "PB toggle OAuth not yet enabled — attempting auto-enable"
+        if (autoEnableOAuth()) {
+            try {
+                createAccessToken()
+                if (state.accessToken) {
+                    log.info "Device State Monitor: OAuth auto-enabled and token created for PB State clicks"
+                    return true
+                }
+            } catch (Exception e2) {
+                log.warn "PB toggle OAuth enabled but token creation failed — ${e2.message}"
+            }
+        }
+    }
+    return false
+}
+
+private def renderDsmJson(Map m) {
+    return render(contentType: "application/json", data: groovy.json.JsonOutput.toJson(m))
+}
+
+private List<Map> getCachedPbFalseRows() {
+    String rowsJson = pbFinalizedResults?.rowsJson?.toString() ?: state.pbFalseRowsJson?.toString() ?: "[]"
+    try {
+        Object parsed = new groovy.json.JsonSlurper().parseText(rowsJson)
+        if (parsed instanceof List) return (parsed as List).collect { it as Map }
+    } catch (Exception e) {
+        log.warn "PB FALSE/UNKNOWN table: cached row JSON could not be read — ${e.message}"
+    }
+    return []
+}
+
+// Update a cached row's PB state in place (the row is retained until the next
+// scan rebuilds the cache) and recompute the live FALSE count.
+private int updateCachedPbFalseRow(int hubNum, String ruleId, boolean newVal) {
+    String targetKey = pbRuleKey(hubNum, ruleId)
+    List<Map> rows = getCachedPbFalseRows().collect { Map r ->
+        if (pbRuleKey(r.hubNum, r.id) == targetKey) {
+            Map copy = new LinkedHashMap(r)
+            copy.privateBool = newVal
+            return copy
+        }
+        return r
+    }
+    int remainingFalse = rows.count { Map r -> r.privateBool == false } as int
+    String rowsJson = groovy.json.JsonOutput.toJson(rows)
+
+    Map updated = pbFinalizedResults != null
+        ? new LinkedHashMap(pbFinalizedResults)
+        : [rowsJson         : rowsJson,
+           scannedCount     : state.pbFalseScannedCount ?: 0,
+           falseCount       : remainingFalse,
+           unknownCount     : state.pbFalseUnknownCount ?: 0,
+           hubCount         : state.pbFalseHubCount ?: 0,
+           lastScan         : state.pbFalseLastScan,
+           scanDuration     : state.pbFalseScanDuration ?: "00:00",
+           discoveryWarnings: state.pbFalseDiscoveryWarnings ?: [],
+           lastError        : state.pbFalseLastError]
+
+    updated.rowsJson   = rowsJson
+    updated.falseCount = remainingFalse
+    pbFinalizedResults = updated
+
+    state.pbFalseRowsJson = rowsJson
+    state.pbFalseCount    = remainingFalse
+    return remainingFalse
+}
+
+def handleSetPbEndpoint() {
+    String ruleId    = params?.id?.toString()
+    String hubNumStr = params?.hubNum?.toString() ?: "1"
+    String valueStr  = params?.value?.toString() ?: "true"
+
+    if (!ruleId || !(ruleId ==~ /\d+/)) {
+        return renderDsmJson([status: "error", message: "Invalid or missing rule ID"])
+    }
+    if (!(hubNumStr in ["1", "2", "3"])) {
+        return renderDsmJson([status: "error", message: "Invalid hub number"])
+    }
+    if (!(valueStr in ["true", "false"])) {
+        return renderDsmJson([status: "error", message: "Invalid value parameter — must be 'true' or 'false'"])
+    }
+    int hubNum      = hubNumStr as int
+    boolean newVal  = (valueStr == "true")
+    String hubLabel = (hubNum == 1)
+        ? (settings["hub1Label"] ?: (location.name ?: "Hub 1"))
+        : (settings["hub${hubNum}Label"] ?: "Hub ${hubNum}")
+
+    if (hubNum != 1 && !remotePbmConfigured(hubNum)) {
+        return renderDsmJson([status: "error", message: "${hubLabel}: remote PB changes require that hub to be enabled and its Private Boolean Manager app ID and access token entered in the PB table settings"])
+    }
+    if (pbCurrentScanId != null) {
+        return renderDsmJson([status: "error", message: "PB scan is in progress; wait for the scan to finish before changing PB state"])
+    }
+    if (pbToggleRuleId != null) {
+        return renderDsmJson([status: "error", message: "Another PB state change is already in progress"])
+    }
+
+    // Setting TRUE requires a cached FALSE row; setting FALSE requires a
+    // cached TRUE row, which can only exist because this table set it TRUE.
+    // Undo is therefore limited to the user's own toggles from this table.
+    boolean expectedCurrent = !newVal
+    boolean isListed = getCachedPbFalseRows().any { Map r ->
+        ((r.hubNum ?: 1) as Integer) == hubNum && r.id?.toString() == ruleId && r.privateBool == expectedCurrent
+    }
+    if (!isListed) {
+        return renderDsmJson([status: "error", message: "Rule is not cached as ${expectedCurrent ? 'FALSE' : 'TRUE'} for ${hubLabel}; run a PB scan and try again"])
+    }
+
+    pbToggleRuleId = pbRuleKey(hubNum, ruleId)
+    try {
+        if (hubNum == 1) {
+            RMUtils.sendAction([ruleId as Long], newVal ? "setRuleBooleanTrue" : "setRuleBooleanFalse", app.label, PB_RM_VERSION)
+        } else {
+            setRemotePb(hubNum, hubLabel, ruleId, newVal)   // throws on any failure
+        }
+        int remaining = updateCachedPbFalseRow(hubNum, ruleId, newVal)
+        log.info "PB State click: ${hubLabel} rule ${ruleId} Private Boolean set ${newVal ? 'TRUE' : 'FALSE'}; ${remaining} FALSE rule(s) now cached (row retained until the next PB scan)"
+        return renderDsmJson([status: "success", value: newVal, remainingFalse: remaining])
+    } catch (Exception e) {
+        log.warn "PB State click failed for ${hubLabel} rule ${ruleId} (set ${newVal ? 'TRUE' : 'FALSE'}) — ${e.message}"
+        return renderDsmJson([status: "error", message: e.message ?: "Unknown error"])
+    } finally {
+        pbToggleRuleId = null
+    }
+}
+
+// True when a remote hub can accept relayed PB changes: the hub is enabled,
+// has an IP, and its Private Boolean Manager app ID + access token are set.
+private boolean remotePbmConfigured(int hubNum) {
+    if (!(hubNum in [2, 3])) return false
+    if (!settings["hub${hubNum}Enabled"]) return false
+    if (!safeString(settings["hub${hubNum}Ip"]).trim()) return false
+    if (settings["hub${hubNum}PbmAppId"] == null) return false
+    if (!safeString(settings["hub${hubNum}PbmToken"]).trim()) return false
+    return true
+}
+
+// Server-side relay from Hub #1 to Private Boolean Manager's /setPB OAuth
+// endpoint on a remote hub. PBM validates the parameters, invokes RMUtils
+// locally on that hub, and updates its own cached PB states. Throws on any
+// transport, HTTP, or PBM-reported failure so the caller returns a real error
+// to the browser instead of updating a table row that did not actually change.
+private void setRemotePb(int hubNum, String hubLabel, String ruleId, boolean newVal) {
+    String ip    = safeString(settings["hub${hubNum}Ip"]).trim()
+    String appId = "${settings["hub${hubNum}PbmAppId"] as Long}"
+    String token = safeString(settings["hub${hubNum}PbmToken"]).trim()
+    String uri   = "http://${ip}/apps/api/${appId}/setPB" +
+                   "?id=${ruleId}&value=${newVal}&access_token=${URLEncoder.encode(token, 'UTF-8')}"
+
+    Map result = null
+    httpGet([uri: uri, contentType: "application/json", timeout: 15]) { resp ->
+        int httpStatus = resp.status as int
+        if (httpStatus != 200) {
+            throw new Exception("${hubLabel} PBM endpoint returned HTTP ${httpStatus}")
+        }
+        def d = resp.data
+        if (d instanceof Map) {
+            result = d as Map
+        } else if (d != null) {
+            try {
+                Object parsed = new groovy.json.JsonSlurper().parseText(d.toString())
+                if (parsed instanceof Map) result = parsed as Map
+            } catch (Exception ignore) { }
+        }
+    }
+
+    if (result == null) {
+        throw new Exception("${hubLabel} PBM endpoint returned an unreadable response (check the app ID and access token)")
+    }
+    if (result.status?.toString() != "success") {
+        throw new Exception("${hubLabel} PBM reported: ${result.message ?: result.status ?: 'unknown error'}")
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // UI HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -810,6 +1435,35 @@ private void renderRemoteHealthDeviceSelector(int hubNum, def allDevices, List h
     } else if (opts != null) {
         paragraph("<span style='color:red;'>No devices available for health monitoring on Hub #${hubNum}.</span>")
     }
+}
+
+// PB FALSE scanning/display is controlled independently for each hub.
+private boolean showPbFalseForHub(int hubNum) {
+    return settings["showPbFalseHub${hubNum}"] != false
+}
+
+// One-time upgrade migration from the pre-1.65 single PB table control: any
+// per-hub PB toggle that was never saved inherits the legacy value, then the
+// legacy setting is removed. Idempotent — a no-op once the legacy key is gone.
+private void migratePbLegacySettings() {
+    def legacy = settings["showPbFalseTable"]
+    if (legacy == null) return
+    boolean legacyShown = legacy != false
+    [1, 2, 3].each { int hubNum ->
+        if (settings["showPbFalseHub${hubNum}"] == null) {
+            app.updateSetting("showPbFalseHub${hubNum}", [type: "bool", value: legacyShown])
+        }
+    }
+    app.removeSetting("showPbFalseTable")
+    log.info "Migrated legacy showPbFalseTable=${legacyShown} to the per-hub PB controls"
+}
+
+private boolean anyPbFalseHubShown() {
+    return [1, 2, 3].any { int hubNum -> showPbFalseForHub(hubNum) }
+}
+
+private Set<Integer> shownPbFalseHubNums() {
+    return [1, 2, 3].findAll { int hubNum -> showPbFalseForHub(hubNum) } as Set
 }
 
 private List normalizeSelectionList(def raw) {
@@ -963,6 +1617,7 @@ private void renderRemoteLockDeviceSelector(int hubNum, def lockDevices, List lo
 
 def installed() {
     syncAppInstanceLabel()
+    checkOAuth()
     initialize()
 }
 
@@ -970,11 +1625,35 @@ def updated() {
     unschedule()
     unsubscribe()
     syncAppInstanceLabel()
+    checkOAuth()
+    migratePbLegacySettings()
+    state.remove("pbFalseScanTotal")   // write-only key from pre-1.72 scans
     initialize()
 }
 
 void initialize() {
+    boolean pbScanWasActive = (pbCurrentScanId != null)
+
     unschedule()
+    pbCurrentScanId              = null
+    pbScanStartMs                = 0L
+    pbScanRuleQueue              = null
+    pbScanPartialResults         = null
+    pbScanSequentialIdx          = 0
+    pbScanSequentialAttempts     = [:]
+    pbScanSequentialActiveKey    = null
+    pbScanSequentialRequestToken = null
+    pbScanSequentialStartedMs    = 0L
+    pbScanDiscoveryWarnings      = null
+    pbToggleRuleId               = null
+    // pbFinalizedResults is deliberately NOT cleared: the last completed
+    // scan's results remain valid across a settings save and keep the table
+    // populated until the restarted scan finishes.
+
+    if (pbScanWasActive) {
+        state.pbFalseScanStatus = "<i>PB scan was cancelled because app settings/code were saved. Click Scan PB FALSE Rules to scan again.</i>"
+    }
+
     subscribe(location, "hsmAlert", hsmAlertHandler)
     log.info "Device State Monitor Multi-Hub initialized"
 }
@@ -1015,7 +1694,735 @@ def appButtonHandler(btn) {
         log.info "HSM alert display cleared manually"
         return
     }
+    if (btn in ["btnScanPbFalseTop", "btnScanPbFalseBottom"]) {
+        if (anyPbFalseHubShown()) startPbFalseScan()
+        return
+    }
+    if (btn in ["refresh", "refresh2"]) {
+        if (enableLogging) log.debug "Device/report refresh requested"
+        return
+    }
     if (enableLogging) log.debug "Button pressed: ${btn}"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PRIVATE BOOLEAN FALSE RULE SCAN
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Discovery mirrors Private Boolean Manager 1.52, but this version generalizes
+// the same /hub2/appsList + /installedapp/statusJson logic across the hubs selected
+// by the three per-hub PB controls. Unselected hubs receive no PB discovery or
+// status requests. Current PB state is read strictly one rule at a time across all
+// selected hubs. An unreadable rule is retried sequentially up to three attempts;
+// if it is still unreadable, it is published as UNKNOWN alongside the FALSE rows
+// so known results remain usable.
+
+// Copy the last finalized PB scan results from the pbFinalizedResults static
+// into the current execution's state snapshot. Safe to call from any render:
+// while a scan is active, the transient "scan in progress" status message is
+// left alone; everything else (rows, counts, timestamps, warnings) reflects
+// the newest completed scan. Idempotent, so calling it on every render is a
+// cheap self-heal against whole-map state overwrites by slow executions.
+private void syncPbFinalizedResults() {
+    Map fin = pbFinalizedResults
+    if (fin == null) return
+
+    state.pbFalseRowsJson     = fin.rowsJson
+    state.pbFalseScannedCount = fin.scannedCount
+    state.pbFalseCount        = fin.falseCount
+    state.pbFalseUnknownCount = fin.unknownCount
+    state.pbFalseHubCount     = fin.hubCount
+    state.pbFalseLastScan     = fin.lastScan
+    state.pbFalseScanDuration = fin.scanDuration
+
+    // While a scan is running, its own status message / discovery warnings /
+    // cleared lastError (set by startPbFalseScan) must not be overwritten
+    // with the previous scan's values.
+    if (pbCurrentScanId == null) {
+        state.pbFalseDiscoveryWarnings = fin.discoveryWarnings ?: []
+        state.pbFalseLastError         = fin.lastError
+        // Only remove a stale "in progress" artifact; leave deliberate
+        // messages (e.g. "scan was cancelled because settings were saved")
+        // in place until the next scan replaces them.
+        if (state.pbFalseScanStatus?.toString()?.contains("scan in progress")) {
+            state.pbFalseScanStatus = null
+        }
+    }
+}
+
+void startPbFalseScan() {
+    if (pbCurrentScanId != null) {
+        if (enableLogging) log.debug "PB FALSE scan already active (${pbCurrentScanId}); duplicate start ignored"
+        return
+    }
+    if (pbToggleRuleId != null) {
+        if (enableLogging) log.debug "PB FALSE scan start ignored while PB rule ${pbToggleRuleId} is being changed"
+        return
+    }
+
+    seedPbFinalizedResultsFromState()
+
+    state.pbFalseLastError = null
+    state.pbFalseScanStatus = state.pbFalseRowsJson
+        ? "<i>PB scan in progress… showing the previous completed results until this scan finishes.</i>"
+        : "<i>PB scan in progress…</i>"
+
+    unschedule("pbFalseScanTimeout")
+    unschedule("pbFalseSequentialStep")
+    unschedule("pbFalseSequentialWatchdog")
+    runIn(PB_SCAN_TIMEOUT_SECS, "pbFalseScanTimeout")
+
+    List<String> discoveryWarnings = []
+    List<Map> ruleApps = getPbRuleAppsAcrossHubs(discoveryWarnings)
+    state.pbFalseDiscoveryWarnings = discoveryWarnings
+    pbScanDiscoveryWarnings = discoveryWarnings
+
+    // Discovery failure is different from an identified rule whose status cannot
+    // be read: if a selected hub's Apps list is unavailable, rules may never have
+    // been enumerated at all. Preserve the previous completed table in that case.
+    if (discoveryWarnings) {
+        unschedule("pbFalseScanTimeout")
+        String msg = "PB scan incomplete during rule discovery: ${discoveryWarnings.join(' | ')} Fresh results were NOT published; the prior cached table is still shown."
+        log.error "PB FALSE scan NOT started — selected-hub discovery was incomplete"
+        preservePbCompletedResultsWithError(msg, discoveryWarnings)
+        clearPbScanTransient()
+        return
+    }
+
+    if (ruleApps.isEmpty()) {
+        unschedule("pbFalseScanTimeout")
+        publishPbFinalizedResults([
+            rowsJson         : groovy.json.JsonOutput.toJson([]),
+            scannedCount     : 0,
+            falseCount       : 0,
+            unknownCount     : 0,
+            hubCount         : 0,
+            lastScan         : new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone),
+            scanDuration     : "00:00",
+            discoveryWarnings: discoveryWarnings,
+            lastError        : null
+        ])
+        return
+    }
+
+    Long nowMs = now() as Long
+    String scanId = "${app.id}-${nowMs}"
+    List<Map> queue = ruleApps.collect { Map r ->
+        [id      : r.id?.toString(),
+         name    : r.name?.toString() ?: "Unknown",
+         appType : r.appType?.toString() ?: "RM",
+         hub     : r.hub?.toString() ?: "Hub",
+         hubNum  : (r.hubNum ?: 1) as Integer,
+         baseUrl : r.baseUrl?.toString(),
+         linkUrl : r.linkUrl?.toString()]
+    }
+
+    pbCurrentScanId              = scanId
+    pbScanStartMs                = nowMs
+    pbScanRuleQueue              = queue
+    pbScanPartialResults         = [:]
+    pbScanSequentialIdx          = 0
+    pbScanSequentialAttempts     = [:]
+    pbScanSequentialActiveKey    = null
+    pbScanSequentialRequestToken = null
+    pbScanSequentialStartedMs    = 0L
+
+    log.info "PB FALSE scan started — ${queue.size()} RM/BC rules across ${queue*.hubNum.unique().size()} hub(s); sequential one-at-a-time status reads, max ${PB_STATUS_READ_MAX_ATTEMPTS} attempt(s) per unreadable rule"
+
+    pbFalseSequentialStep()
+}
+
+// Reads exactly one rule-status endpoint at a time across the full selected-hub
+// queue. A known TRUE or FALSE result advances immediately to the next rule.
+// UNKNOWN/unreadable results retry the SAME rule sequentially up to the configured
+// attempt limit, then publish that identified rule as UNKNOWN and continue.
+void pbFalseSequentialStep() {
+    String scanId = pbCurrentScanId
+    if (scanId == null) return
+    if (pbScanSequentialActiveKey != null) return
+
+    unschedule("pbFalseSequentialStep")
+
+    int idx   = pbScanSequentialIdx ?: 0
+    int total = pbScanRuleQueue?.size() ?: 0
+
+    if (idx >= total) {
+        finishPbSequentialScan()
+        return
+    }
+
+    Map rule = pbScanRuleQueue[idx] as Map
+    String key = pbRuleKey(rule.hubNum, rule.id)
+    int attempt = ((pbScanSequentialAttempts?.get(key) ?: 0) as int) + 1
+    String requestToken = "${scanId}:${key}:${attempt}:${now()}"
+
+    pbScanSequentialActiveKey    = key
+    pbScanSequentialRequestToken = requestToken
+    pbScanSequentialStartedMs    = now() as Long
+
+    if (enableLogging) {
+        log.debug "PB FALSE sequential read ${idx + 1}/${total}: ${rule.hub} rule ${rule.id} (${rule.name}), attempt ${attempt}/${PB_STATUS_READ_MAX_ATTEMPTS}"
+    }
+
+    try {
+        asynchttpGet("handlePbFalseSequentialResponse",
+            [uri: "${rule.baseUrl}/installedapp/statusJson/${rule.id}", timeout: PB_STATUS_REQUEST_TIMEOUT_SECS],
+            [scanId      : scanId,
+             requestToken: requestToken,
+             attempt     : attempt,
+             ruleKey     : key,
+             ruleId      : rule.id,
+             ruleName    : rule.name,
+             appType     : rule.appType,
+             hub         : rule.hub,
+             hubNum      : rule.hubNum,
+             linkUrl     : rule.linkUrl]
+        )
+        unschedule("pbFalseSequentialWatchdog")
+        runIn(PB_STATUS_WATCHDOG_INTERVAL_SECS, "pbFalseSequentialWatchdog")
+    } catch (Exception e) {
+        log.warn "PB FALSE scan: could not start sequential statusJson for ${rule.hub} rule ${rule.id} (${rule.name}), attempt ${attempt}/${PB_STATUS_READ_MAX_ATTEMPTS} — ${e.message}"
+        clearPbSequentialActiveRequest()
+        handlePbSequentialUnknown(rule, attempt, "request could not be started")
+    }
+}
+
+void pbFalseSequentialWatchdog() {
+    if (pbCurrentScanId == null) return
+    if (pbScanSequentialActiveKey == null) return
+
+    Long startedMs = (pbScanSequentialStartedMs ?: 0L) as Long
+    Long ageMs = (now() as Long) - startedMs
+    if (startedMs && ageMs > (PB_STATUS_REQUEST_TIMEOUT_SECS * 1000L)) {
+        int idx = pbScanSequentialIdx ?: 0
+        Map rule = (pbScanRuleQueue && idx < pbScanRuleQueue.size())
+            ? (pbScanRuleQueue[idx] as Map)
+            : [:]
+        String key = pbRuleKey(rule.hubNum, rule.id)
+        int attempt = ((pbScanSequentialAttempts?.get(key) ?: 0) as int) + 1
+        log.warn "PB FALSE scan: sequential statusJson timeout for ${rule.hub ?: 'Hub'} rule ${rule.id ?: ''} (${rule.name ?: ''}), attempt ${attempt}/${PB_STATUS_READ_MAX_ATTEMPTS}"
+        clearPbSequentialActiveRequest()
+        handlePbSequentialUnknown(rule, attempt, "statusJson timeout")
+        return
+    }
+
+    runIn(PB_STATUS_WATCHDOG_INTERVAL_SECS, "pbFalseSequentialWatchdog")
+}
+
+void handlePbFalseSequentialResponse(resp, data) {
+    String scanId = data.scanId?.toString()
+    if (pbCurrentScanId != scanId) return
+
+    String requestToken = data.requestToken?.toString()
+    if (!requestToken || requestToken != pbScanSequentialRequestToken) {
+        if (enableLogging) log.debug "PB FALSE scan: late/stale sequential callback ignored for ${data.hub} rule ${data.ruleId} (${data.ruleName})"
+        return
+    }
+
+    unschedule("pbFalseSequentialWatchdog")
+
+    String ruleKey = data.ruleKey?.toString() ?: pbRuleKey(data.hubNum, data.ruleId)
+    int attempt = (data.attempt ?: 1) as int
+    Map rule = [id: data.ruleId, name: data.ruleName, appType: data.appType,
+                hub: data.hub, hubNum: data.hubNum, linkUrl: data.linkUrl]
+    Map resultRow = buildPbScanResultFromResponse(resp, data)
+
+    clearPbSequentialActiveRequest()
+
+    if (resultRow.privateBool == null) {
+        handlePbSequentialUnknown(rule, attempt, "unreadable/malformed statusJson")
+        return
+    }
+
+    pbScanPartialResults[ruleKey] = resultRow
+    pbScanSequentialAttempts.remove(ruleKey)
+    pbScanSequentialIdx = (pbScanSequentialIdx ?: 0) + 1
+    pbFalseSequentialStep()
+}
+
+private void handlePbSequentialUnknown(Map rule, int attempt, String reason) {
+    if (pbCurrentScanId == null) return
+
+    String key = pbRuleKey(rule.hubNum, rule.id)
+    pbScanSequentialAttempts[key] = attempt
+
+    if (attempt < PB_STATUS_READ_MAX_ATTEMPTS) {
+        log.warn "PB FALSE scan: ${rule.hub} rule ${rule.id} (${rule.name}) unreadable after sequential attempt ${attempt}/${PB_STATUS_READ_MAX_ATTEMPTS} (${reason}); retrying the same rule"
+        runIn(1, "pbFalseSequentialStep")
+        return
+    }
+
+    log.warn "PB FALSE scan: ${rule.hub} rule ${rule.id} (${rule.name}) remained unreadable after ${PB_STATUS_READ_MAX_ATTEMPTS} sequential attempt(s) — marking UNKNOWN in the published table"
+    pbScanPartialResults[key] = buildPbScanResultRow(rule, null, "")
+    pbScanSequentialAttempts.remove(key)
+    pbScanSequentialIdx = (pbScanSequentialIdx ?: 0) + 1
+    pbFalseSequentialStep()
+}
+
+private Map buildPbScanResultFromResponse(resp, data) {
+    String ruleId = data.ruleId?.toString()
+    Map status = [:]
+    boolean statusOk = false
+
+    try {
+        int httpStatus = resp.getStatus() as int
+        if (httpStatus == 200) {
+            Object raw = resp.getData()
+            if (raw instanceof Map) {
+                status = raw as Map
+                statusOk = isPbStatusPayload(status)
+            } else if (raw != null) {
+                String rawText = raw.toString()
+                String trimmed = rawText.trim()
+                if (trimmed.startsWith("{")) {
+                    Object parsed = new groovy.json.JsonSlurper().parseText(rawText)
+                    if (parsed instanceof Map) {
+                        status = parsed as Map
+                        statusOk = isPbStatusPayload(status)
+                    }
+                } else if (looksLikeLoginPage(rawText)) {
+                    log.warn "PB FALSE scan: ${data.hub} returned a login page for rule ${ruleId} (${data.ruleName})"
+                } else {
+                    log.warn "PB FALSE scan: non-JSON statusJson payload for ${data.hub} rule ${ruleId} (${data.ruleName})"
+                }
+            }
+            if (!statusOk && status) {
+                log.warn "PB FALSE scan: malformed statusJson payload for ${data.hub} rule ${ruleId} (${data.ruleName}) — appState collection missing"
+            }
+        } else {
+            log.warn "PB FALSE scan: HTTP ${httpStatus} for ${data.hub} rule ${ruleId} (${data.ruleName})"
+        }
+    } catch (Exception e) {
+        log.warn "PB FALSE scan: could not parse statusJson for ${data.hub} rule ${ruleId} (${data.ruleName}) — ${e.message}"
+    }
+
+    Boolean privateBool = extractPbPrivateBool(status, statusOk)
+    Map rule = [id: ruleId, name: data.ruleName, appType: data.appType,
+                hub: data.hub, hubNum: data.hubNum, linkUrl: data.linkUrl]
+    Map resultRow = buildPbScanResultRow(rule, privateBool, extractPbLastRun(status))
+
+    if (enableLogging) {
+        log.debug "PB FALSE scan: ${data.hub} ${data.ruleName} (${ruleId}, ${data.appType}) PrivateBool=${privateBool}"
+    }
+    return resultRow
+}
+
+private void clearPbSequentialActiveRequest() {
+    unschedule("pbFalseSequentialWatchdog")
+    pbScanSequentialActiveKey    = null
+    pbScanSequentialRequestToken = null
+    pbScanSequentialStartedMs    = 0L
+}
+
+private void finishPbSequentialScan() {
+    if (pbCurrentScanId == null) return
+
+    List<Map> queued = pbScanRuleQueue ?: []
+    Map partial = pbScanPartialResults ?: [:]
+    List<Map> unknownRules = queued.findAll { Map rule ->
+        Map row = partial[pbRuleKey(rule.hubNum, rule.id)] as Map
+        return row == null || row.privateBool == null
+    }
+
+    if (unknownRules) {
+        String examples = unknownRules.take(3).collect { Map r -> "${r.hub} rule ${r.id} (${r.name})" }.join("; ")
+        String more = unknownRules.size() > 3 ? "; plus ${unknownRules.size() - 3} more" : ""
+        log.warn "PB FALSE scan: ${unknownRules.size()} rule(s) remain UNKNOWN after sequential verification and will be published for manual inspection — ${examples}${more}"
+    }
+
+    finalizePbFalseScan()
+}
+
+private Map buildPbScanResultRow(Map rule, Boolean privateBool, String lastRun) {
+    return [
+        id         : rule.id?.toString(),
+        name       : rule.name?.toString() ?: "Unknown",
+        appType    : rule.appType?.toString() ?: "RM",
+        hub        : rule.hub?.toString() ?: "Hub",
+        hubNum     : (rule.hubNum ?: 1) as Integer,
+        linkUrl    : rule.linkUrl?.toString() ?: "",
+        lastRun    : lastRun ?: "",
+        privateBool: privateBool
+    ]
+}
+
+void pbFalseScanTimeout() {
+    if (pbCurrentScanId != null) {
+        int completed = pbScanPartialResults?.size() ?: 0
+        int total     = pbScanRuleQueue?.size() ?: 0
+        String duration = formatPbScanDuration(((now() as Long) - (pbScanStartMs ?: (now() as Long))) as long)
+        String msg = "PB scan timed out after ${duration} with ${completed}/${total} rule-status reads completed. Fresh results were NOT published; the prior cached table is still shown."
+        log.error "PB FALSE scan watchdog timeout — ${msg}"
+        preservePbCompletedResultsWithError(msg)
+        clearPbScanTransient()
+    }
+}
+
+void finalizePbFalseScan() {
+    unschedule("pbFalseScanTimeout")
+    unschedule("pbFalseSequentialStep")
+    unschedule("pbFalseSequentialWatchdog")
+
+    try {
+        List<Map> queued = pbScanRuleQueue ?: []
+        Map partial      = pbScanPartialResults ?: [:]
+
+        List<Map> allRows = queued.collect { Map rule ->
+            String key = pbRuleKey(rule.hubNum, rule.id)
+            Map row = partial[key] as Map
+            if (row) return row
+            return [id: rule.id?.toString(), name: rule.name?.toString() ?: "Unknown",
+                    appType: rule.appType?.toString() ?: "RM", hub: rule.hub?.toString() ?: "Hub",
+                    hubNum: (rule.hubNum ?: 1) as Integer, linkUrl: rule.linkUrl?.toString() ?: "",
+                    lastRun: "", privateBool: null]
+        }
+
+        int unknownCount = allRows.count { it.privateBool == null } as int
+        Long endMs        = now() as Long
+        Long startedMs    = (pbScanStartMs ?: endMs) as Long
+
+        List<Map> falseRows   = allRows.findAll { it.privateBool == false }
+        List<Map> reportRows  = allRows.findAll { it.privateBool == false || it.privateBool == null }
+        int hubCount          = queued*.hubNum.unique().size()
+
+        String rowsJson  = "[]"
+        String lastError = null
+        try {
+            rowsJson = groovy.json.JsonOutput.toJson(reportRows)
+        } catch (Exception e) {
+            log.warn "PB FALSE scan: could not cache FALSE/UNKNOWN rows — ${e.message}"
+            lastError = "PB scan completed, but the FALSE/UNKNOWN rule rows could not be cached: ${e.message}"
+        }
+
+        Map results = [
+            rowsJson         : rowsJson,
+            scannedCount     : allRows.size(),
+            falseCount       : falseRows.size(),
+            unknownCount     : unknownCount,
+            hubCount         : hubCount,
+            lastScan         : new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone),
+            scanDuration     : formatPbScanDuration((endMs - startedMs) as long),
+            discoveryWarnings: pbScanDiscoveryWarnings ?: [],
+            lastError        : lastError
+        ]
+
+        publishPbFinalizedResults(results)
+
+        log.info "PB FALSE scan complete in ${results.scanDuration}: ${falseRows.size()} FALSE of ${allRows.size()} RM/BC rules; ${unknownCount} UNKNOWN after retries"
+
+    } catch (Exception e) {
+        log.error "PB FALSE scan finalize failed — ${e.message}"
+        preservePbCompletedResultsWithError("PB scan failed while finalizing results: ${e.message}. Fresh results were NOT published; the prior cached table is still shown.")
+    } finally {
+        clearPbScanTransient()
+    }
+}
+
+// Single writer for completed-scan results. The static copy is authoritative
+// and clobber-proof; the state mirror is best-effort and self-heals through
+// syncPbFinalizedResults() on the next page render if a concurrent execution's
+// whole-map state commit overwrites it.
+private void publishPbFinalizedResults(Map results) {
+    pbFinalizedResults = results
+
+    state.pbFalseRowsJson          = results.rowsJson
+    state.pbFalseScannedCount      = results.scannedCount
+    state.pbFalseCount             = results.falseCount
+    state.pbFalseUnknownCount      = results.unknownCount
+    state.pbFalseHubCount          = results.hubCount
+    state.pbFalseLastScan          = results.lastScan
+    state.pbFalseScanDuration      = results.scanDuration
+    state.pbFalseDiscoveryWarnings = results.discoveryWarnings
+    state.pbFalseLastError         = results.lastError
+    state.pbFalseScanStatus        = null
+}
+
+private void seedPbFinalizedResultsFromState() {
+    if (pbFinalizedResults != null || state.pbFalseRowsJson == null) return
+    pbFinalizedResults = [
+        rowsJson         : state.pbFalseRowsJson?.toString() ?: "[]",
+        scannedCount     : state.pbFalseScannedCount ?: 0,
+        falseCount       : state.pbFalseCount ?: 0,
+        unknownCount     : state.pbFalseUnknownCount ?: 0,
+        hubCount         : state.pbFalseHubCount ?: 0,
+        lastScan         : state.pbFalseLastScan,
+        scanDuration     : state.pbFalseScanDuration ?: "00:00",
+        discoveryWarnings: state.pbFalseDiscoveryWarnings ?: [],
+        lastError        : state.pbFalseLastError
+    ]
+}
+
+private void preservePbCompletedResultsWithError(String msg, List currentWarnings = null) {
+    seedPbFinalizedResultsFromState()
+    Map kept = pbFinalizedResults != null
+        ? new LinkedHashMap(pbFinalizedResults)
+        : [rowsJson         : state.pbFalseRowsJson,
+           scannedCount     : state.pbFalseScannedCount ?: 0,
+           falseCount       : state.pbFalseCount ?: 0,
+           unknownCount     : state.pbFalseUnknownCount ?: 0,
+           hubCount         : state.pbFalseHubCount ?: 0,
+           lastScan         : state.pbFalseLastScan,
+           scanDuration     : state.pbFalseScanDuration ?: "00:00",
+           discoveryWarnings: state.pbFalseDiscoveryWarnings ?: [],
+           lastError        : null]
+    kept.lastError = msg
+    if (currentWarnings != null) kept.discoveryWarnings = currentWarnings
+    pbFinalizedResults = kept
+    state.pbFalseLastError = msg
+    if (currentWarnings != null) state.pbFalseDiscoveryWarnings = currentWarnings
+    state.pbFalseScanStatus = null
+}
+
+private void clearPbScanTransient() {
+    unschedule("pbFalseScanTimeout")
+    unschedule("pbFalseSequentialStep")
+    unschedule("pbFalseSequentialWatchdog")
+    pbCurrentScanId              = null
+    pbScanStartMs                = 0L
+    pbScanRuleQueue              = null
+    pbScanPartialResults         = null
+    pbScanSequentialIdx          = 0
+    pbScanSequentialAttempts     = [:]
+    pbScanSequentialActiveKey    = null
+    pbScanSequentialRequestToken = null
+    pbScanSequentialStartedMs    = 0L
+    pbScanDiscoveryWarnings      = null
+}
+
+private String pbRuleKey(def hubNum, def ruleId) {
+    return "${hubNum ?: 1}:${ruleId ?: ''}"
+}
+
+private List<Map> getPbRuleAppsAcrossHubs(List<String> warnings) {
+    List<Map> hubs = []
+
+    // The per-hub PB controls are scan selectors as well as display selectors.
+    // Do not even fetch /hub2/appsList for a hub whose PB control is off.
+    if (showPbFalseForHub(1)) {
+        hubs << [
+            hubNum : 1,
+            hub    : settings["hub1Label"] ?: (location.name ?: "Hub 1"),
+            baseUrl: PB_RM_BASE_URL
+        ]
+    }
+
+    [2, 3].each { int hubNum ->
+        if (showPbFalseForHub(hubNum) && settings["hub${hubNum}Enabled"]) {
+            String ip = safeString(settings["hub${hubNum}Ip"]).trim()
+            String label = safeString(settings["hub${hubNum}Label"]).trim() ?: "Hub ${hubNum}"
+            if (ip) {
+                hubs << [hubNum: hubNum, hub: label, baseUrl: "http://${ip}"]
+            } else {
+                warnings << "${label}: PB scan skipped because no hub IP address is configured."
+            }
+        }
+    }
+
+    if (enableLogging) {
+        String selected = hubs ? hubs.collect { it.hub?.toString() ?: "Hub ${it.hubNum}" }.join(", ") : "none"
+        log.debug "PB FALSE scan hubs selected for discovery: ${selected}"
+    }
+
+    List<Map> rules = []
+    hubs.each { Map hubSpec ->
+        rules.addAll(getPbRuleAppsForHub(hubSpec, warnings))
+    }
+
+    return rules.sort { Map a, Map b ->
+        int hubCmp = (a.hub?.toString()?.toLowerCase() ?: "") <=> (b.hub?.toString()?.toLowerCase() ?: "")
+        return hubCmp != 0 ? hubCmp : ((a.name?.toString()?.toLowerCase() ?: "") <=> (b.name?.toString()?.toLowerCase() ?: ""))
+    }
+}
+
+private List<Map> getPbRuleAppsForHub(Map hubSpec, List<String> warnings) {
+    List<Map> rules = []
+    Set<String> seenIds = [] as Set
+    String hubLabel = hubSpec.hub?.toString() ?: "Hub"
+    String baseUrl  = hubSpec.baseUrl?.toString()
+
+    try {
+        String body = fetchRawText("${baseUrl}/hub2/appsList", 15)
+        if (!body) throw new Exception("empty response")
+        String trimmed = body.trim()
+        if (!trimmed.startsWith("{") && looksLikeLoginPage(body)) {
+            warnings << "${hubLabel}: PB scan unavailable because Hub Login Security/login protection blocked the internal Apps page."
+            return rules
+        }
+
+        Object parsed = new groovy.json.JsonSlurper().parseText(body)
+        Map root = parsed instanceof Map ? (parsed as Map) : [:]
+        def apps = root?.apps
+        if (!(apps instanceof Collection)) throw new Exception("Apps list JSON did not contain an apps collection")
+
+        apps.each { parentApp ->
+            def pd = parentApp?.data
+            String parentType  = pd?.type?.toString()  ?: ""
+            String parentName  = pd?.name?.toString()  ?: ""
+            String parentLabel = pd?.label?.toString() ?: ""
+            String appType     = getPbSupportedAutomationAppType(parentType, parentName, parentLabel)
+
+            if (appType) {
+                parentApp?.children?.each { child ->
+                    collectPbRmLeafRules(child, appType, hubSpec, rules, seenIds, 0)
+                }
+            }
+        }
+    } catch (Exception e) {
+        warnings << "${hubLabel}: PB rule discovery failed — ${e.message}"
+        log.warn "PB FALSE scan discovery failed for ${hubLabel} (${baseUrl}) — ${e.message}"
+    }
+
+    if (enableLogging) log.debug "PB FALSE scan: discovered ${rules.size()} RM/BC rules on ${hubLabel}"
+    return rules
+}
+
+private void collectPbRmLeafRules(Object node, String parentAppType, Map hubSpec,
+                                  List<Map> rules, Set<String> seenIds, int depth) {
+    if (depth > 6) return
+    List children = (node?.children ?: []) as List
+
+    if (children.isEmpty()) {
+        def d = node?.data
+        if (d?.id && d?.name) {
+            String id = d.id.toString()
+            if (!seenIds.contains(id)) {
+                String childType         = d?.type?.toString()    ?: ""
+                String childAppName      = d?.appName?.toString() ?: ""
+                String childDetectedType = getPbSupportedAutomationAppType(childType, childAppName)
+                String finalAppType      = (parentAppType == "BC" || childDetectedType == "BC") ? "BC" : (childDetectedType ?: parentAppType)
+                String baseUrl           = hubSpec.baseUrl?.toString()
+
+                seenIds << id
+                rules << [
+                    id      : id,
+                    name    : d.name.toString(),
+                    appType : finalAppType,
+                    hub     : hubSpec.hub?.toString() ?: "Hub",
+                    hubNum  : (hubSpec.hubNum ?: 1) as Integer,
+                    baseUrl : baseUrl,
+                    // Browser links for Hub #1 must be relative: 127.0.0.1 would
+                    // otherwise point at the user's PC rather than the hub.
+                    linkUrl : ((hubSpec.hubNum ?: 1) as Integer) == 1
+                        ? "/installedapp/configure/${id}"
+                        : "${baseUrl}/installedapp/configure/${id}"
+                ]
+            }
+        }
+    } else {
+        children.each { child -> collectPbRmLeafRules(child, parentAppType, hubSpec, rules, seenIds, depth + 1) }
+    }
+}
+
+private String getPbSupportedAutomationAppType(String type, String name, String label = "") {
+    String combined = [type, name, label].findAll { it }.join(" ").toLowerCase()
+    if (!combined) return null
+
+    // Basic Button Controller is not an RM-compatible child-rule type with the
+    // Private Boolean status semantics used here.
+    if (combined.contains("basic button controller") || combined.contains("basicbuttoncontroller")) return null
+    if (combined.contains("button controller") || combined.contains("buttoncontroller")) return "BC"
+    if (combined.contains("rule machine") || combined.contains("rulemachine")) return "RM"
+    return null
+}
+
+private boolean isPbStatusPayload(Map status) {
+    return status?.appState instanceof Collection
+}
+
+private Boolean extractPbPrivateBool(Map status, boolean knownRead = false) {
+    for (Map item : (status?.appState ?: [])) {
+        if (item?.name?.toString() == "private") {
+            return asPbBooleanLoose(item?.value)
+        }
+    }
+    // Successful status read + no private state means RM's default FALSE.
+    // Failed/unknown read remains null so it can never be misreported as FALSE.
+    return knownRead ? false : null
+}
+
+private Boolean asPbBooleanLoose(Object value) {
+    if (value == null) return false
+    if (value instanceof Boolean) return value as Boolean
+    return value.toString().equalsIgnoreCase("true")
+}
+
+private String extractPbLastRun(Map status) {
+    String lastEvtDate = ""
+    String lastEvtTime = ""
+    String timeFormat  = ""
+    String dateFormat  = ""
+
+    status?.appState?.each { item ->
+        String n = item?.name?.toString() ?: ""
+        if (n == "lastEvtDate") lastEvtDate = item?.value?.toString() ?: ""
+        if (n == "lastEvtTime") lastEvtTime = item?.value?.toString() ?: ""
+        if (n == "timeFormat")  timeFormat  = item?.value?.toString() ?: ""
+        if (n == "dateFormat")  dateFormat  = item?.value?.toString() ?: ""
+    }
+
+    if (!lastEvtDate) return ""
+
+    java.text.SimpleDateFormat outDateTimeFmt = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm")
+    java.text.SimpleDateFormat outDateFmt     = new java.text.SimpleDateFormat("yyyy-MM-dd")
+    java.text.SimpleDateFormat outTimeFmt     = new java.text.SimpleDateFormat("HH:mm")
+
+    boolean hasTimeComponent = lastEvtDate.toUpperCase().contains("AM") ||
+                               lastEvtDate.toUpperCase().contains("PM") ||
+                               lastEvtDate.indexOf(":", 6) >= 0
+
+    if (hasTimeComponent) {
+        List<String> fullDateFmts = [
+            "dd-MMM-yyyy hh:mm:ss a", "dd-MMM-yyyy HH:mm:ss",
+            "dd-MMM-yyyy hh:mm a",    "dd-MMM-yyyy HH:mm",
+            "MM/dd/yyyy hh:mm:ss a",  "MM/dd/yyyy HH:mm:ss",
+            "yyyy-MM-dd HH:mm:ss",    "yyyy-MM-dd hh:mm:ss a"
+        ]
+        for (String fmt : fullDateFmts) {
+            try { return outDateTimeFmt.format(new java.text.SimpleDateFormat(fmt).parse(lastEvtDate)) }
+            catch (Exception ignored) {}
+        }
+        log.warn "extractPbLastRun: unrecognized full datetime '${lastEvtDate}'"
+        return "* ${lastEvtDate}"
+    }
+
+    if (!lastEvtDate.matches(/\d{4}-\d{2}-\d{2}/)) {
+        List<String> dateFmts = (dateFormat ? [dateFormat] : []) + ["dd-MMM-yyyy", "MM/dd/yyyy", "dd/MM/yyyy", "MMM dd, yyyy"]
+        String normalizedDate = null
+        for (String fmt : dateFmts) {
+            try {
+                normalizedDate = outDateFmt.format(new java.text.SimpleDateFormat(fmt).parse(lastEvtDate))
+                break
+            } catch (Exception ignored) {}
+        }
+        if (normalizedDate) lastEvtDate = normalizedDate
+        else {
+            log.warn "extractPbLastRun: unrecognized date format '${lastEvtDate}'"
+            lastEvtDate = "* ${lastEvtDate}"
+        }
+    }
+
+    if (!lastEvtTime) return lastEvtDate
+
+    List<String> timeFmts = timeFormat ? [timeFormat] : []
+    timeFmts += ["hh:mm:ss a", "h:mm:ss a", "HH:mm:ss", "hh:mm a", "h:mm a", "HH:mm", "h:mm"]
+    for (String fmt : timeFmts) {
+        try { return "${lastEvtDate} ${outTimeFmt.format(new java.text.SimpleDateFormat(fmt).parse(lastEvtTime))}" }
+        catch (Exception ignored) {}
+    }
+
+    log.warn "extractPbLastRun: could not parse time '${lastEvtTime}' (timeFormat='${timeFormat}')"
+    return "* ${lastEvtDate} ${lastEvtTime}"
+}
+
+private String formatPbScanDuration(long elapsedMs) {
+    // NOTE: Groovy's '/' on two longs yields a BigDecimal, and
+    // Math.max(Long, BigDecimal) is an ambiguous overload that throws a
+    // GroovyRuntimeException at runtime (this crashed finalizePbFalseScan()
+    // at the end of every scan in 1.60/1.61). intdiv() keeps it all long math.
+    long totalSecs = Math.max(0L, elapsedMs).intdiv(1000L)
+    long mins      = totalSecs.intdiv(60L)
+    long secs      = totalSecs % 60L
+    return String.format("%02d:%02d", mins, secs)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1038,6 +2445,9 @@ private void loadRemoteDeviceList(int hubNum, String ip, String appId, String to
     def disabledIds = []
     try {
         def respData = fetchJson(uri, 15)
+        if (respData instanceof List && respData.isEmpty()) {
+            log.warn "${hubLabel}: Maker API device list returned no usable devices (empty or all-null) — device pickers cannot be (re)loaded until that hub's Maker API is fixed"
+        }
         respData?.each { dev ->
                 if (enableLogging && switchList.isEmpty() && allList.isEmpty())
                     log.debug "${hubLabel}: first device raw = id:${dev.id} disabled:${dev.disabled} status:${dev.status} caps:${dev.capabilities}"
@@ -1103,8 +2513,13 @@ private void loadHub1AllDevices() {
             ]
         }
         state["hub1AllDevices"]       = allList
-        state["hub1AllDevicesStatus"] = "OK: ${allList.size()} device${allList.size() == 1 ? '' : 's'} loaded"
-        log.info "${hubLabel}: Loaded ${allList.size()} device(s) for health monitoring."
+        if (allList.isEmpty()) {
+            state["hub1AllDevicesStatus"] = "Error: Maker API returned no usable devices (empty or all-null device list) — a recent platform/beta update is the usual cause"
+            log.warn "${hubLabel}: Maker API device list returned no usable devices — pickers cannot be (re)loaded until the hub's Maker API is fixed"
+        } else {
+            state["hub1AllDevicesStatus"] = "OK: ${allList.size()} device${allList.size() == 1 ? '' : 's'} loaded"
+            log.info "${hubLabel}: Loaded ${allList.size()} device(s) for health monitoring."
+        }
     } catch (Exception e) {
         log.error "${hubLabel}: Error loading health device list — ${e.message}"
         state["hub1AllDevices"]       = []
@@ -1128,8 +2543,12 @@ String handler() {
         "${s}.${t}s"
     }
     def timingDetail = " [Data:${fmtMs(collectMs)}, Render:${fmtMs(renderMs)}]"
-    def htmlOut = report.html
-    htmlOut    += "<br><small><i>Last run: ${state.lastRun} (Scan time: ${totalStr}${timingDetail})</i></small>"
+    // "Last run" is rendered at the TOP of the report, immediately under the
+    // first Refresh Table button. It previously followed the last table, where
+    // its proximity to the PB scan summary line made it look like a PB-scan
+    // timestamp rather than the whole-report refresh time.
+    def htmlOut = "<small><i>Last run: ${state.lastRun} (Scan time: ${totalStr}${timingDetail})</i></small>"
+    htmlOut    += report.html
     htmlOut    += buildTableJS()
     return htmlOut
 }
@@ -1181,16 +2600,22 @@ private Map collectAllDeviceStates() {
         return true
     }
 
-    // Helper: resolve lastActivity for local devices, falling back to parent for child devices
+    // Helper: resolve lastActivity for local devices, falling back to parent for
+    // child devices. Apps cannot look up arbitrary local devices (there is no
+    // getDeviceById() in the Hubitat app sandbox — every call threw
+    // MissingMethodException), so the parent is fetched through Hub #1's own
+    // Maker API when its credentials are configured.
     def resolveLocalLastActivity = { dev ->
         def lastAct = dev.getLastActivity()
         if (lastAct == null) {
             try {
                 def parentId = dev.device?.parentDeviceId
-                if (parentId) {
-                    def parentDev = getDeviceById(parentId)
-                    lastAct = parentDev?.getLastActivity()
-                    if (enableLogging && lastAct) log.debug "Used parent lastActivity for child ${dev.displayName}"
+                if (parentId && hub1CanToggle) {
+                    def pData = fetchJson("http://127.0.0.1:8080/apps/api/${hub1AppId}/devices/${parentId}?access_token=${hub1Token}", 5)
+                    if (pData instanceof Map) {
+                        lastAct = parseRemoteLastActivity(pData.lastActivity, hub1LabelVal, "${parentId}-p")
+                        if (enableLogging && lastAct) log.debug "Used parent lastActivity (via Hub #1 Maker API) for child ${dev.displayName}"
+                    }
                 }
             } catch (ex) {
                 if (enableLogging) log.debug "Could not resolve parent lastActivity for ${dev.displayName}: ${ex.message}"
@@ -1234,20 +2659,36 @@ private Map collectAllDeviceStates() {
     }
     // Health pool – Hub #1
     // Primary source: hub1HealthDevs (capability.* picker) — direct device objects.
-    // Supplementary: hub1SelectedHealthDevices (enum/ID list from Maker API load path) —
-    // resolves IDs via getDeviceById() to catch devices that don't surface in the
-    // capability.* picker (e.g. Actuator-only drivers like MQTT Display Publisher).
+    // Supplementary: hub1SelectedHealthDevices (enum/ID list from the Maker API
+    // load path) covers devices that don't surface in the capability.* picker
+    // (e.g. Actuator-only drivers like MQTT Display Publisher). Apps cannot
+    // resolve arbitrary local devices as objects (getDeviceById() does not
+    // exist in the app sandbox and every call threw MissingMethodException, so
+    // this path never actually worked before 1.75), so the supplementary IDs
+    // are health-checked through Hub #1's OWN Maker API — the same code path
+    // used for Hubs #2/#3 — and the row links are rewritten to relative URLs.
     def hub1HealthDevObjs = (hub1HealthDevs ?: []) as List
     def hub1HealthDevIds  = hub1HealthDevObjs.collect { it.id.toString() } as Set
     def hub1SelectedIds   = normalizeSelectionList(settings["hub1SelectedHealthDevices"])
-    hub1SelectedIds.each { sid ->
-        if (!hub1HealthDevIds.contains(sid)) {
-            try {
-                def extra = getDeviceById(sid)
-                if (extra) hub1HealthDevObjs << extra
-            } catch (ex) {
-                if (enableLogging) log.debug "Hub #1 health: could not resolve device ID ${sid} — ${ex.message}"
-            }
+    Set hub1SupplementIds = hub1SelectedIds.findAll { !hub1HealthDevIds.contains(it) } as Set
+    if (hub1SupplementIds) {
+        if (hub1CanToggle) {
+            def (supRows, supWarn) = fetchRemoteHealthDeviceStates("127.0.0.1:8080",
+                    hub1AppId.toString(), hub1Token.toString(), hub1LabelVal.toString(),
+                    excludeVirt, excludeSysRoom, [] as Set, hub1SupplementIds,
+                    activityThresholdMs, activityThreshHours)
+            if (supWarn && !warnings.contains(supWarn)) warnings << supWarn
+            healthPool.addAll(supRows.collect { e ->
+                [displayName: e.displayName, room: e.room, hub: hub1LabelVal,
+                 linkUrl: "/device/edit/${e.devId}", status: e.status,
+                 lastActivity: e.lastActivity, lastActivityStr: e.lastActivityStr,
+                 issue: e.issue,
+                 healthStatus: e.healthStatus ?: "n/a",
+                 battery:     e.battery      ?: "n/a",
+                 lastBattery: e.lastBattery  ?: "n/a"]
+            })
+        } else if (enableLogging) {
+            log.info "Hub #1 health: ${hub1SupplementIds.size()} supplementary device ID(s) skipped — Hub #1 Maker API app ID and token are required to health-check devices outside the capability picker"
         }
     }
     hub1HealthDevObjs.findAll(filterLocal).each { dev ->
@@ -1385,6 +2826,14 @@ private List fetchRemoteDeviceStates(String ip, String appId, String token,
     try {
         if (enableLogging) log.debug "Querying ${hubLabel} — ids: ${selectedIds}"
         def respData = fetchJson(uri, 10)
+        if (respData instanceof List && respData.isEmpty() && selectedIds) {
+            // An empty (or all-null, see fetchJson) device list cannot be
+            // distinguished from "no devices selected in Maker API" — either
+            // way, silently returning nothing would render clean tables that
+            // hide the outage. Surface it instead.
+            warning = "${hubLabel} (${ip}): Maker API returned no usable device data (empty or all-null device list) — this hub's switch states are unavailable until its Maker API is fixed (a recent platform/beta update is the usual cause)."
+            return [results, warning]
+        }
         respData?.each { dev ->
                 def devId = dev.id?.toString()
                 if (!selectedIds.contains(devId)) return
@@ -1470,6 +2919,10 @@ private List fetchRemoteLockStates(String ip, String appId, String token,
     def uri = "http://${ip}/apps/api/${appId}/devices?access_token=${token}"
     try {
         def respData = fetchJson(uri, 10)
+        if (respData instanceof List && respData.isEmpty() && selectedIds) {
+            warning = "${hubLabel} (${ip}): Maker API returned no usable device data (empty or all-null device list) — this hub's lock/contact states are unavailable until its Maker API is fixed (a recent platform/beta update is the usual cause)."
+            return [results, warning]
+        }
         respData?.each { dev ->
                 def devId = dev.id?.toString()
                 if (!selectedIds.contains(devId)) return
@@ -1553,6 +3006,10 @@ private List fetchRemoteContactStates(String ip, String appId, String token,
     def uri = "http://${ip}/apps/api/${appId}/devices?access_token=${token}"
     try {
         def respData = fetchJson(uri, 10)
+        if (respData instanceof List && respData.isEmpty() && selectedIds) {
+            warning = "${hubLabel} (${ip}): Maker API returned no usable device data (empty or all-null device list) — this hub's lock/contact states are unavailable until its Maker API is fixed (a recent platform/beta update is the usual cause)."
+            return [results, warning]
+        }
         respData?.each { dev ->
                 def devId = dev.id?.toString()
                 if (!selectedIds.contains(devId)) return
@@ -1632,6 +3089,10 @@ private List fetchRemoteHealthDeviceStates(String ip, String appId, String token
     def errors         = []
     def now            = new Date()
     def hubUnreachable = false
+    // Circuit breaker: when the hub's Maker API is broken, every per-device
+    // request fails the same way — stop after a few identical failures instead
+    // of logging one warn per selected device.
+    int consecutiveFailures = 0
     // Cache parent lastActivity so siblings share one parent-events fetch.
     // Map<parentId(String), Date|null>
     def parentCache    = [:]
@@ -1650,6 +3111,15 @@ private List fetchRemoteHealthDeviceStates(String ip, String appId, String token
         if (listData instanceof List) {
             liveIds = listData.collect { it.id?.toString() } as Set
             if (enableLogging) log.debug "${hubLabel}: live device list has ${liveIds.size()} IDs"
+            if (!liveIds && selectedIds) {
+                // A list with zero usable entries (empty, or all-null as seen
+                // with a broken platform/beta build) cannot distinguish
+                // disabled devices. Treating it as authoritative would skip
+                // every selected device and render a clean health table — a
+                // false all-clear. Report the outage and stop instead.
+                warning = "${hubLabel} (${ip}): Maker API returned no usable device data (empty or all-null device list) — health/activity results for this hub are unavailable until its Maker API is fixed (a recent platform/beta update is the usual cause)."
+                return [results, warning]
+            }
         }
     } catch (Exception listEx) {
         if (enableLogging) log.debug "${hubLabel}: live device list fetch failed (disabled check unavailable) — ${listEx.message}"
@@ -1670,6 +3140,7 @@ private List fetchRemoteHealthDeviceStates(String ip, String appId, String token
             def uri = "http://${ip}/apps/api/${appId}/devices/${devId}?access_token=${token}"
             if (enableLogging) log.debug "Health check ${hubLabel} device ${devId}"
             def dev = fetchJson(uri, 10)
+            consecutiveFailures = 0
             if (!dev) return
                 if (dev.disabled == true || dev.disabled?.toString() == "true" ||
                     (dev.status ?: "").toString().toUpperCase() == "DISABLED") return
@@ -1788,12 +3259,22 @@ private List fetchRemoteHealthDeviceStates(String ip, String appId, String token
         } catch (java.net.SocketTimeoutException e) {
             errors << "device ${devId}: timed out"
             if (enableLogging) log.warn "${hubLabel} device ${devId}: timeout — ${e}"
+            consecutiveFailures++
+            if (consecutiveFailures >= 3 && results.isEmpty()) {
+                hubUnreachable = true
+                warning = "${hubLabel} (${ip}): Maker API is not responding (${consecutiveFailures} consecutive timeouts) — remaining ${selectedIds.size() - errors.size()} health check(s) skipped."
+            }
         } catch (java.net.ConnectException e) {
             hubUnreachable = true
             warning = "${hubLabel} (${ip}): Could not connect (health check) — check IP address."
         } catch (Exception e) {
             errors << "device ${devId}: ${e.message}"
             if (enableLogging) log.warn "${hubLabel} device ${devId}: error — ${e.message}"
+            consecutiveFailures++
+            if (consecutiveFailures >= 3 && results.isEmpty()) {
+                hubUnreachable = true
+                warning = "${hubLabel} (${ip}): Maker API is not returning device data (${e.message}) — remaining ${selectedIds.size() - errors.size()} health check(s) skipped."
+            }
         }
     }
 
@@ -1886,6 +3367,11 @@ private String fetchRawText(String uri, int timeoutSec) {
             body = ""
         } else if (d instanceof String) {
             body = d
+        } else if (d instanceof Map || d instanceof List) {
+            // Newer platform builds can deliver JSON responses already parsed
+            // (see fetchJson). Callers of this helper parse text themselves,
+            // so re-serialize to keep both old and new behavior working.
+            body = groovy.json.JsonOutput.toJson(d)
         } else {
             try { body = d.text } catch (ignore) { body = d.toString() }
         }
@@ -2222,7 +3708,7 @@ private Map generateReportTables() {
 
     // ON table
     html += buildTable(onPool.findAll { it.switchVal == "on" },
-        "<b>Devices that are ON</b>", "table_on", "#cc0000", "ON", "color:red;font-weight:bold;",
+        "<br><br><b>Devices that are ON</b>", "table_on", "#cc0000", "ON", "color:red;font-weight:bold;",
         settings["sortByOn"] ?: "displayName", settings["sortOrderOn"] ?: "asc", "off",
         bothLinks, "Also monitored for OFF state")
 
@@ -2273,6 +3759,14 @@ private Map generateReportTables() {
             settings["sortByHealth"]    ?: "displayName",
             settings["sortOrderHealth"] ?: "asc",
             (settings["activityThresholdHours"] ?: 24) as long)
+    }
+
+    // Rules with Private Boolean FALSE table — intentionally after Health / Activity.
+    if (anyPbFalseHubShown()) {
+        html += "<br>"
+        html += buildPbFalseTable(
+            settings["sortByPbFalse"]    ?: "name",
+            settings["sortOrderPbFalse"] ?: "asc")
     }
 
     return [html: html, collectMs: collectMs]
@@ -2584,6 +4078,162 @@ private String buildHealthTable(List devices, String title, String tableId, Stri
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PRIVATE BOOLEAN FALSE / UNKNOWN RULE TABLE BUILDER
+// ─────────────────────────────────────────────────────────────────────────────
+
+private String buildPbFalseTable(String sortBy, String sortOrder) {
+    // getCachedPbFalseRows() prefers the clobber-proof static copy of the
+    // finalized results over the state mirror.
+    List<Map> rows = getCachedPbFalseRows()
+
+    // Keep one combined PB table and display only rows from hubs whose
+    // per-hub PB control is enabled. The same controls also select which hubs
+    // are scanned; filtering here immediately hides stale cached rows from a
+    // hub that was disabled before the next PB scan replaces the cache.
+    Set<Integer> visibleHubNums = shownPbFalseHubNums()
+    rows = rows.findAll { Map r ->
+        int rowHubNum = (r.hubNum ?: 1) as Integer
+        return visibleHubNums.contains(rowHubNum)
+    }
+
+    String pbSetEndpoint = ""
+    if (state.accessToken) {
+        pbSetEndpoint = "/apps/api/${app.id}/setPb?access_token=${state.accessToken}"
+    }
+
+    int sortColIdx = 0
+    switch (sortBy) {
+        case "appType": sortColIdx = 1; break
+        case "hub":         sortColIdx = 2; break
+        case "privateBool": sortColIdx = 3; break
+        case "lastRun":     sortColIdx = 4; break
+        default:         sortColIdx = 0; break
+    }
+    String sortClass = (sortOrder == "desc") ? "sort-desc" : "sort-asc"
+
+    rows = rows.sort { Map r ->
+        switch (sortBy) {
+            case "appType": return r.appType?.toString()?.toLowerCase() ?: ""
+            case "hub":         return r.hub?.toString()?.toLowerCase() ?: ""
+            case "privateBool": return r.privateBool == null ? "unknown" : (r.privateBool == false ? "false" : "true")
+            case "lastRun":     return r.lastRun?.toString() ?: ""
+            default:         return r.name?.toString()?.toLowerCase() ?: ""
+        }
+    }
+    if (sortOrder == "desc") rows = rows.reverse()
+
+    int falseCount   = rows.count { Map r -> r.privateBool == false } as int
+    int visibleUnknownCount = rows.count { Map r -> r.privateBool == null } as int
+    int scannedCount = state.pbFalseScannedCount != null ? (state.pbFalseScannedCount as int) : 0
+    int unknownCount = state.pbFalseUnknownCount != null ? (state.pbFalseUnknownCount as int) : 0
+    int hubCount     = state.pbFalseHubCount != null ? (state.pbFalseHubCount as int) : 0
+    String falseCountStr = (falseCount > 0) ? "${falseCount} rule${falseCount == 1 ? '' : 's'}" : "No rules"
+    String unknownCountStr = "${visibleUnknownCount} rule${visibleUnknownCount == 1 ? '' : 's'}"
+
+    String html = "<h4 style='margin-bottom:4px;'><b>Rules with Private Boolean FALSE</b>: " +
+                  "<span id='pbfalse-count' data-count='${falseCount}'>${falseCountStr}</span>" +
+                  (visibleUnknownCount > 0 ? "; <b>UNKNOWN after retries</b>: <span id='pbunknown-count' data-count='${visibleUnknownCount}'>${unknownCountStr}</span>" : "") +
+                  ".</h4>"
+
+    if (state.pbFalseScanStatus) {
+        html += "${state.pbFalseScanStatus}<br>"
+    }
+
+    if (state.pbFalseLastScan) {
+        html += "<small><i>PB scan: ${scannedCount} RM/BC rule${scannedCount == 1 ? '' : 's'} across ${hubCount} hub${hubCount == 1 ? '' : 's'} with RM/BC rules; " +
+                "${unknownCount} UNKNOWN after sequential retries. Last completed scan: ${htmlEscape(state.pbFalseLastScan)} " +
+                "(${htmlEscape(state.pbFalseScanDuration ?: '00:00')}).</i></small><br>"
+    } else if (!state.pbFalseScanStatus) {
+        html += "<small><i>No PB scan has completed yet. Click Scan PB FALSE Rules.</i></small><br>"
+    }
+
+    List warnings = (state.pbFalseDiscoveryWarnings ?: []) as List
+    warnings.each { w ->
+        html += "<small style='color:#CC6600;font-weight:bold;'>⚠ ${htmlEscape(w)}</small><br>"
+    }
+    if (state.pbFalseLastError) {
+        html += "<small style='color:red;font-weight:bold;'>⚠ ${htmlEscape(state.pbFalseLastError)}</small><br>"
+    }
+
+    boolean hasClickTargets = rows.any { Map r ->
+        int hn = (r.hubNum ?: 1) as Integer
+        return r.privateBool != null && (hn == 1 || remotePbmConfigured(hn))
+    }
+    if (!pbSetEndpoint && hasClickTargets) {
+        html += "<small style='color:#CC6600;'><i>PB State clicks are unavailable because the app OAuth endpoint is not active. Re-open or re-save the app; if needed, enable OAuth manually in Apps Code.</i></small><br>"
+    }
+
+    if (!rows.isEmpty()) {
+        html += "<div class='dsm-scroll-wrap'>"
+        html += "<table id='table_pbfalse' class='on-table' cellpadding='0' cellspacing='0' " +
+                "style='--hdr-bg:#8B0000;table-layout:fixed;width:100%;min-width:690px;'>"
+        html += "<colgroup><col><col style='width:100px'><col class='dsm-col-hub col-hub'><col style='width:95px'><col style='width:165px'></colgroup>"
+        html += "<thead><tr>"
+        html += "<th onclick='sortOnTable(\"table_pbfalse\",0)' class='${sortColIdx == 0 ? sortClass : ''}'>Rule</th>"
+        html += "<th onclick='sortOnTable(\"table_pbfalse\",1)' class='${sortColIdx == 1 ? sortClass : ''}'>App Type</th>"
+        html += "<th onclick='sortOnTable(\"table_pbfalse\",2)' class='dsm-col-hub ${sortColIdx == 2 ? sortClass : ''}'>Hub</th>"
+        html += "<th onclick='sortOnTable(\"table_pbfalse\",3)' class='${sortColIdx == 3 ? sortClass : ''}'>PB State</th>"
+        html += "<th onclick='sortOnTable(\"table_pbfalse\",4)' class='${sortColIdx == 4 ? sortClass : ''}'>Last Run</th>"
+        html += "</tr></thead><tbody>"
+
+        rows.each { Map r ->
+            String ruleName = renderPbRuleNameHtml(r.name ?: "Unknown")
+            String linkUrl  = htmlEscape(r.linkUrl ?: "")
+            String nameCell = linkUrl ? "<a href='${linkUrl}' target='_blank'>${ruleName}</a>" : ruleName
+            String lastRun  = htmlEscape(r.lastRun ?: "Never / unavailable")
+            int rowHubNum    = (r.hubNum ?: 1) as Integer
+            String stateCell
+
+            if (r.privateBool == null) {
+                String tip = "PB state remained unreadable after ${PB_STATUS_READ_MAX_ATTEMPTS} read attempt(s); click the linked rule name to inspect manually"
+                stateCell = "<td class='state-col' title='${htmlEscape(tip)}' " +
+                            "style='color:darkorange;font-weight:bold;text-align:center;white-space:nowrap;'>UNKNOWN</td>"
+            } else {
+                boolean isFalse   = (r.privateBool == false)
+                String stateTxt   = isFalse ? "FALSE" : "TRUE"
+                String stateColor = isFalse ? "red" : "blue"
+                boolean clickable = (rowHubNum == 1 || remotePbmConfigured(rowHubNum)) &&
+                                    pbSetEndpoint && pbCurrentScanId == null && pbToggleRuleId == null
+                if (clickable) {
+                    String baseUrl  = htmlEscape("${pbSetEndpoint}&id=${r.id}&hubNum=${rowHubNum}")
+                    String relayTip = rowHubNum == 1 ? "" : " (relayed to Private Boolean Manager on ${r.hub ?: 'the remote hub'})"
+                    String clickTip = isFalse
+                        ? "Click to set this rule Private Boolean TRUE${relayTip}"
+                        : "Click to set this rule Private Boolean back FALSE${relayTip}; the row remains listed until the next PB scan"
+                    stateCell = "<td class='state-col state-clickable pb-state-clickable' " +
+                                "data-pb-url='${baseUrl}' data-pb-current='${isFalse ? 'false' : 'true'}' " +
+                                "onclick='togglePbState(this)' " +
+                                "title='${htmlEscape(clickTip)}' " +
+                                "style='color:${stateColor};font-weight:bold;text-align:center;white-space:nowrap;cursor:pointer;'>" +
+                                "<span class='pb-state-label'>${stateTxt}</span></td>"
+                } else {
+                    String tip = pbCurrentScanId != null ? "PB scan in progress — state change temporarily disabled" :
+                                 pbToggleRuleId != null  ? "Another PB state change is in progress" :
+                                 !pbSetEndpoint          ? "PB toggle endpoint unavailable" :
+                                 "To make this hub's PB State cells clickable, enter its Private Boolean Manager app ID and access token in the PB table settings"
+                    stateCell = "<td class='state-col' title='${htmlEscape(tip)}' " +
+                                "style='color:${stateColor};font-weight:bold;text-align:center;white-space:nowrap;'>${stateTxt}</td>"
+                }
+            }
+
+            html += "<tr>"
+            html += "<td>${nameCell}</td>"
+            html += "<td style='text-align:center;white-space:nowrap;'>${htmlEscape(r.appType ?: 'RM')}</td>"
+            html += "<td class='dsm-col-hub hub-col'>${htmlEscape(r.hub ?: 'Hub')}</td>"
+            html += stateCell
+            html += "<td style='white-space:nowrap;font-size:0.9em;'>${lastRun}</td>"
+            html += "</tr>"
+        }
+        html += "</tbody></table></div>"
+        if (rows.any { Map r -> r.privateBool == true }) {
+            html += "<small><i>Rows changed to TRUE from this table remain listed (and can be clicked back to FALSE) until the next PB scan.</i></small><br>"
+        }
+    }
+
+    return html
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // STATE CELL BUILDER
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2728,6 +4378,66 @@ async function toggleStateCell(cell) {
         cell.style.opacity = '1';
         cell.style.cursor  = 'pointer';
         setTimeout(() => { lbl.textContent = savedTxt; cell.dataset.busy = 'false'; }, 3000);
+    }
+}
+
+// ── Private Boolean FALSE → TRUE (Hub #1 only) ─────────────────────────────
+async function togglePbState(cell) {
+    const baseUrl = cell.dataset.pbUrl;
+    if (!baseUrl || window._pbTrueClickBusy || cell.dataset.busy === 'true') return;
+    const cur  = cell.dataset.pbCurrent === 'true';
+    const next = !cur;
+    window._pbTrueClickBusy = true;
+
+    cell.dataset.busy = 'true';
+    const lbl = cell.querySelector('.pb-state-label') || cell;
+    const savedTxt = lbl.textContent;
+    lbl.textContent = '…';
+    cell.style.opacity = '0.5';
+    cell.style.cursor = 'wait';
+
+    try {
+        const resp = await fetch(baseUrl + '&value=' + next);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const text = await resp.text();
+        if (!text || !text.trim()) throw new Error('Empty response from PB endpoint');
+        let result;
+        try { result = JSON.parse(text); }
+        catch (e) { throw new Error('Non-JSON response: ' + text.substring(0, 100)); }
+        if (result.status !== 'success') throw new Error(result.message || JSON.stringify(result));
+
+        const nowTrue = result.value === true || result.value === 'true';
+        cell.dataset.pbCurrent = nowTrue ? 'true' : 'false';
+        lbl.textContent = nowTrue ? 'TRUE' : 'FALSE';
+        cell.style.cssText = 'color:' + (nowTrue ? 'blue' : 'red') +
+            ';font-weight:bold;text-align:center;white-space:nowrap;cursor:pointer;';
+        cell.style.opacity = '1';
+        cell.title = nowTrue
+            ? 'Click to set this rule Private Boolean back FALSE; the row remains listed until the next PB scan'
+            : 'Click to set this rule Private Boolean TRUE';
+        cell.dataset.busy = 'false';
+
+        const countEl = document.getElementById('pbfalse-count');
+        if (countEl) {
+            const remaining = Number.isFinite(Number(result.remainingFalse))
+                ? Number(result.remainingFalse)
+                : Math.max(0, parseInt(countEl.dataset.count || '0', 10) + (nowTrue ? -1 : 1));
+            countEl.dataset.count = String(remaining);
+            countEl.textContent = remaining > 0
+                ? remaining + ' rule' + (remaining === 1 ? '' : 's')
+                : 'No rules';
+        }
+    } catch (err) {
+        lbl.textContent = '⚠ Err';
+        cell.style.opacity = '1';
+        cell.style.cursor = 'pointer';
+        setTimeout(function() {
+            lbl.textContent = savedTxt;
+            cell.dataset.busy = 'false';
+        }, 2500);
+        alert('Set Private Boolean ' + (next ? 'TRUE' : 'FALSE') + ' failed: ' + err.message);
+    } finally {
+        window._pbTrueClickBusy = false;
     }
 }
 
@@ -2885,8 +4595,23 @@ private Object fetchJson(String uri, int timeoutSec) {
 
     Object parsed = null
     httpGet(reqParams) { resp ->
-        String body
         def d = resp.data
+
+        // Newer platform builds (first seen on the 2026-07-07 beta) can hand
+        // resp.data back ALREADY PARSED as a Map/List when the response is
+        // application/json, regardless of the requested contentType. Coercing
+        // those through the text fallback below silently mangles them:
+        // map.text is a missing key → null → "empty response", and list.text
+        // spread-collects a nonexistent 'text' property from every element →
+        // a list of nulls whose toString is "[null, null, …]" — valid JSON
+        // that parses to an all-null device list. Accept parsed data directly;
+        // this is compatible with both old and new platform behavior.
+        if (resp.status == 200 && (d instanceof Map || d instanceof List)) {
+            parsed = d
+            return
+        }
+
+        String body
         if (d == null) {
             body = ""
         } else if (d instanceof String) {
@@ -2903,7 +4628,7 @@ private Object fetchJson(String uri, int timeoutSec) {
             throw new Exception("HTTP ${resp.status}${body ? ' — body starts: ' + jsonErrSnippet(body) : ''}")
         }
         if (!body) {
-            throw new Exception("hub returned an empty response (HTTP 200)")
+            throw new Exception("hub returned an empty response (HTTP 200) for ${base} — if this URL (plus the access token) is also blank in a browser, the Maker API app on that hub is malfunctioning: open that Maker API app and press Done, or reboot that hub")
         }
         if (!(body.startsWith("{") || body.startsWith("["))) {
             String hint = ""
@@ -2917,6 +4642,17 @@ private Object fetchJson(String uri, int timeoutSec) {
         }
         parsed = new groovy.json.JsonSlurper().parseText(body)
     }
+    // A Maker API device list can contain literal null entries (typically a
+    // deleted device still referenced by that Maker API app's selection).
+    // A single null used to abort the whole hub's query with
+    // "Cannot get property 'id' on null object"; drop them here — after the
+    // closure, so the filter applies to pre-parsed and text-parsed responses
+    // alike — and every caller gets a clean list.
+    if (parsed instanceof List && (parsed as List).contains(null)) {
+        int nullCount = (parsed as List).count { it == null } as int
+        log.warn "fetchJson: ${base} returned ${nullCount} null entr${nullCount == 1 ? 'y' : 'ies'} in its device list — usually a deleted device still selected in that hub's Maker API app; open that Maker API app, review its device selection, and press Done"
+        parsed = (parsed as List).findAll { it != null }
+    }
     return parsed
 }
 
@@ -2926,6 +4662,21 @@ private String jsonErrSnippet(String body) {
     String s = body.replaceAll(/\s+/, " ")
     if (s.length() > 160) s = s.substring(0, 160) + "…"
     return htmlEscape(s)
+}
+
+// Render Hubitat rule-name status suffixes such as
+// <span style='color:red'>(Required Expression false)</span> as colored text
+// instead of literal HTML source. Escape the complete name first, then restore
+// only a narrowly restricted color span. This mirrors Private Boolean Manager's
+// safe rule-name renderer and prevents arbitrary HTML in a rule name from being
+// interpreted by the report page.
+private String renderPbRuleNameHtml(Object val) {
+    if (val == null) return ""
+    String encoded = htmlEscape(val)
+    return encoded.replaceAll(
+        /&lt;span style=(?:&#39;|&quot;)color:([a-zA-Z#0-9]+)(?:&#39;|&quot;)&gt;(.*?)&lt;\/span&gt;/,
+        "<span style='color:\$1'>\$2</span>"
+    )
 }
 
 private String htmlEscape(Object val) {
