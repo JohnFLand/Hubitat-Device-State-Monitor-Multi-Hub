@@ -114,8 +114,9 @@ Hub #1 is the hub running Device State Monitor. Its devices are accessed directl
 | **Select lock-monitored devices** | Devices that appear in the Lock State table. Uses a `capability.lock` picker. Virtual lock devices are always included regardless of the Exclude Virtual Devices setting, since these are explicit selections. |
 | **Select contact-monitored devices** | Devices that appear in the Contact Sensor table. Uses a `capability.contactSensor` picker. Like locks, these are explicit selections, so virtual devices are always included. |
 | **Toggle Command & Health Monitor Settings** | Toggle to reveal Maker API credentials for Hub #1. These are used for two purposes: (1) clickable State cells in the ON/OFF tables and embedded toggle buttons in the Unknown table; (2) the Load / Select All / Clear All actions in the health device picker. If left blank, State cells are non-interactive and health selection reverts to a manual capability picker. |
-| **Hub #1 Health Device List Actions** | Appears once Maker API credentials are entered. Choose **⟳ Load / Reload** to fetch the device list, then **✓ Select All** or **✗ Clear** to bulk-manage health selections. |
-| **Select health/activity-monitored devices** | The capability picker — always visible. Devices selected here appear in the Health/Activity table when flagged. Disabled devices are automatically excluded. |
+| **Hub #1 Health Device List Actions** | Appears once Maker API credentials are entered. Choose **⟳ Load / Reload** to fetch the device list, then **✓ Select All** or **✗ Clear** to bulk-manage health selections. *(As of 1.78 these actions operate on the capability picker below directly — see note.)* |
+| **Select health/activity-monitored devices** | The capability picker — always visible, and **as of 1.78 the single source of truth** for which picker-visible devices are health-monitored on Hub #1. Devices selected here appear in the Health/Activity table when flagged; unchecking a device removes it. Disabled devices are automatically excluded. |
+| **Additional health-monitor device IDs — Hub #1** | *(New in 1.78.)* Optional. A list of numeric device **IDs** for devices that do **not** appear in the capability picker — for example Actuator-only drivers such as MQTT Display Publisher. This is the only supplementary path in 1.78. IDs already selected in the picker above are ignored here, so the two can never double-count. |
 
 ---
 
@@ -248,6 +249,8 @@ Lists any health-monitored device that meets one or more of:
 | **Late Activity (>Xh)** | Last recorded device activity is older than the configured threshold |
 
 The **Issue** column may contain multiple reasons separated by commas if more than one condition applies.
+
+On **Hub #1**, the devices monitored here come from two independent sources: everything you check in the **capability picker** (the single source of truth as of 1.78 — unchecking a device reliably removes it), plus any IDs you list in **Additional health-monitor device IDs — Hub #1** for devices the picker cannot show (e.g. Actuator-only drivers). IDs already in the picker are ignored in the additional field, so nothing is counted twice.
 
 For child devices (e.g. individual endpoints of a USB switch hub), last activity is resolved from the parent device if the child has no activity record of its own. On Hub #1 this parent lookup goes through Hub #1's own Maker API, using the same credentials configured for toggle links — without them, the fallback is skipped (with a single info log entry) and the child is evaluated on its own record.
 
@@ -480,7 +483,7 @@ A collapsible **Notes / User Guide** section appears below Sort & Display Option
 
 ## Maintenance
 
-**Upgrading the app code:** Paste the new version over the existing app code (Apps Code → open the app → replace → Save), then open the app instance and click **Done** once so subscriptions and settings re-initialize. When upgrading across version 1.56, run **⟳ Load / Reload Device List** on each remote hub once to populate the new contact sensor selector. When upgrading across version 1.60, the Private Boolean FALSE table appears and its first scan starts automatically on the next page open (its per-hub controls default to on; a pre-1.72 single PB visibility setting is migrated to the per-hub controls automatically).
+**Upgrading the app code:** Paste the new version over the existing app code (Apps Code → open the app → replace → Save), then open the app instance and click **Done** once so subscriptions and settings re-initialize. When upgrading across version 1.56, run **⟳ Load / Reload Device List** on each remote hub once to populate the new contact sensor selector. When upgrading across version 1.60, the Private Boolean FALSE table appears and its first scan starts automatically on the next page open (its per-hub controls default to on; a pre-1.72 single PB visibility setting is migrated to the per-hub controls automatically). When upgrading across version 1.78, the old hidden Hub #1 health list (previously populated by **Select All**) is retired and removed automatically on the first **Done** — the capability picker now governs everything it can show. If you had relied on **Select All** to pull in a device the picker cannot display (e.g. an Actuator-only driver such as MQTT Display Publisher), re-add that one device by ID in the new **Additional health-monitor device IDs — Hub #1** field.
 
 **Adding devices to a remote hub's report:** Add the device in the remote hub's Maker API app, then run **⟳ Load / Reload** from the Actions dropdown. The new device will appear in the pickers.
 
