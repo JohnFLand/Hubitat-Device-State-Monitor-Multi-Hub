@@ -360,6 +360,26 @@ CHANGES IN 1.76:
       selection still reports normally, and hubs with working APIs are
       unaffected.
 
+CHANGES IN 1.78:
+    * FIX: The Hub #1 capability picker is now the single source of truth for
+      health/activity monitoring of picker-visible devices. Previously a second,
+      hidden ID list (hub1SelectedHealthDevices) was populated by "Select All"
+      and merged into the report as "supplementary" devices. Because unchecking a
+      device in the capability picker never touched that hidden list, unchecked
+      devices kept reappearing in the Health/Activity table — the picker was
+      effectively unable to REMOVE anything once "Select All" had run.
+    * The supplementary path now reads ONLY from a new, explicit text input,
+      "Additional health-monitor device IDs — Hub #1" (hub1ExtraHealthIds),
+      intended solely for the niche case the supplement was designed for:
+      devices that do not surface in the capability.* picker (e.g. Actuator-only
+      drivers such as MQTT Display Publisher). IDs already selected in the picker
+      are ignored there, so the two can never double-count.
+    * "Select All" / "Clear All" now operate on the capability picker only. The
+      hidden hub1SelectedHealthDevices setting is retired and is removed on
+      upgrade (see updated()). If you were relying on "Select All" to pull in a
+      picker-invisible device, re-add that one device by ID in the new field;
+      everything the picker can show is governed entirely by the picker.
+
 CHANGES IN 1.77:
     * ROOT CAUSE FOUND AND FIXED for the 2026-07-07 outage: it was never the
       responding hubs' Maker APIs — it was the HTTP CLIENT on the hub running
@@ -419,7 +439,7 @@ import groovy.transform.Field
 @Field static String    pbToggleRuleId           = null   // serializes PB click actions against scans / other clicks
 
 definition(
-    name:         "Device State Monitor Multi-Hub 1.77",
+    name:         "Device State Monitor Multi-Hub 1.78",
     namespace:    "John Land",
     author:       "John Land via Claude AI and ChatGPT",
     description:  "Reports device states, health/activity, and FALSE Private Booleans across up to three hubs",
@@ -524,14 +544,6 @@ def mainPage() {
 
         def hub1HealthActionVal  = settings["hub1HealthAction"]
         def hub1HealthActionOpen = (hub1HealthActionVal && hub1HealthActionVal != "none")
-        def h1HealthList         = normalizeSelectionList(settings["hub1SelectedHealthDevices"])
-        if (hub1HealthActionOpen) {
-            def stored = state["hub1AllDevices"] ?: []
-            switch (hub1HealthActionVal) {
-                case "selAllHealth":   h1HealthList = stored.collect { it.id.toString() }; break
-                case "unselAllHealth": h1HealthList = []; break
-            }
-        }
 
         section(hideable: true, hidden: !(hub1HealthActionOpen), title: hub1Title) {
             // Process hub1HealthAction inside the section so side-effects happen during render
@@ -541,13 +553,13 @@ def mainPage() {
                     case "load":
                         loadHub1AllDevices(); break
                     case "selAllHealth":
-                        // Sync both the enum (for display) and the capability.* input (for data access)
-                        app.updateSetting("hub1SelectedHealthDevices", [value: h1AllIds, type: "enum"])
-                        app.updateSetting("hub1HealthDevs",            [value: h1AllIds, type: "capability"])
+                        // Operate on the capability picker only — it is the single
+                        // source of truth for picker-visible devices. (Picker-invisible
+                        // devices are handled via the explicit hub1ExtraHealthIds field.)
+                        app.updateSetting("hub1HealthDevs", [value: h1AllIds, type: "capability"])
                         break
                     case "unselAllHealth":
-                        app.updateSetting("hub1SelectedHealthDevices", [value: [], type: "enum"])
-                        app.updateSetting("hub1HealthDevs",            [value: [], type: "capability"])
+                        app.updateSetting("hub1HealthDevs", [value: [], type: "capability"])
                         break
                 }
                 app.updateSetting("hub1HealthAction", [value: "none", type: "enum"])
@@ -621,11 +633,29 @@ def mainPage() {
                 paragraph("<small><i>Configure Hub #1 Maker API credentials above to enable " +
                           "<b>Load / Select All / Clear All</b> for health monitoring.</i></small>")
             }
-            // Capability picker always shown — data collection uses this directly (no API call needed)
+            // Capability picker always shown — data collection uses this directly (no API call needed).
+            // This picker is the SINGLE source of truth for picker-visible devices: checking adds,
+            // unchecking removes, with no hidden list overriding it.
             def h1HealthSelCount = (hub1HealthDevs ?: []).size()
             input "hub1HealthDevs", "capability.*",
                 title: "Select health/activity-monitored devices (${h1HealthSelCount} selected)",
                 submitOnChange: true, multiple: true, required: false
+
+            // Explicit supplement for the niche case the picker cannot cover:
+            // devices whose driver exposes no capability the capability.* picker
+            // recognizes (e.g. Actuator-only drivers like MQTT Display Publisher).
+            // IDs already selected in the picker above are ignored here, so the
+            // two never double-count.
+            def h1ExtraCount = (settings["hub1ExtraHealthIds"] ?: "").split(",").collect { it.trim() }.findAll { it }.size()
+            input "hub1ExtraHealthIds", "text",
+                title: "Additional health-monitor device IDs — Hub #1 (${h1ExtraCount} entered)",
+                description: "Comma-separated device IDs. Only for devices that do NOT appear in the picker above.",
+                required: false, submitOnChange: true
+            if (h1ExtraCount > 0 && !(settings["hub1AppId"] && settings["hub1Token"])) {
+                paragraph("<small><i><span style='color:red;'>Note:</span> extra device IDs are health-checked " +
+                          "through Hub #1's Maker API — configure the Hub #1 Maker API app ID and token above, " +
+                          "or these IDs are skipped.</i></small>")
+            }
         }
 
         // ── Hub #2 – Remote ───────────────────────────────────────────────────
@@ -1458,6 +1488,25 @@ private void migratePbLegacySettings() {
     log.info "Migrated legacy showPbFalseTable=${legacyShown} to the per-hub PB controls"
 }
 
+// One-time upgrade migration for 1.78: the pre-1.78 hidden Hub #1 health list
+// (hub1SelectedHealthDevices) is retired. The capability picker (hub1HealthDevs)
+// is now the single source of truth for picker-visible devices, and picker-
+// invisible devices are entered explicitly in hub1ExtraHealthIds. Removing the
+// stale setting clears any devices that "Select All" had dumped into it and that
+// unchecking in the picker could never remove. Only the Hub #1 key is touched;
+// the remote hubs' hub2/hub3 SelectedHealthDevices settings are unaffected.
+// Idempotent — a no-op once the key is gone.
+private void migrateHiddenHealthList() {
+    def legacy = settings["hub1SelectedHealthDevices"]
+    if (legacy == null) return
+    int n = normalizeSelectionList(legacy).size()
+    app.removeSetting("hub1SelectedHealthDevices")
+    log.info "Retired legacy hub1SelectedHealthDevices (had ${n} ID(s)). The Hub #1 " +
+             "capability picker is now authoritative; if any of those were devices that " +
+             "do not appear in the picker, re-add them by ID in 'Additional health-monitor " +
+             "device IDs — Hub #1'."
+}
+
 private boolean anyPbFalseHubShown() {
     return [1, 2, 3].any { int hubNum -> showPbFalseForHub(hubNum) }
 }
@@ -1627,6 +1676,7 @@ def updated() {
     syncAppInstanceLabel()
     checkOAuth()
     migratePbLegacySettings()
+    migrateHiddenHealthList()          // retire pre-1.78 hub1SelectedHealthDevices
     state.remove("pbFalseScanTotal")   // write-only key from pre-1.72 scans
     initialize()
 }
@@ -2659,18 +2709,20 @@ private Map collectAllDeviceStates() {
     }
     // Health pool – Hub #1
     // Primary source: hub1HealthDevs (capability.* picker) — direct device objects.
-    // Supplementary: hub1SelectedHealthDevices (enum/ID list from the Maker API
-    // load path) covers devices that don't surface in the capability.* picker
-    // (e.g. Actuator-only drivers like MQTT Display Publisher). Apps cannot
-    // resolve arbitrary local devices as objects (getDeviceById() does not
-    // exist in the app sandbox and every call threw MissingMethodException, so
-    // this path never actually worked before 1.75), so the supplementary IDs
-    // are health-checked through Hub #1's OWN Maker API — the same code path
-    // used for Hubs #2/#3 — and the row links are rewritten to relative URLs.
+    // This picker is authoritative for every device it can show: checking adds a
+    // device and unchecking removes it, with nothing else able to re-add it.
+    // Supplementary: hub1ExtraHealthIds (explicit comma-separated ID list) covers
+    // ONLY devices that don't surface in the capability.* picker (e.g. Actuator-
+    // only drivers like MQTT Display Publisher). Apps cannot resolve arbitrary
+    // local devices as objects (getDeviceById() does not exist in the app
+    // sandbox), so these IDs are health-checked through Hub #1's OWN Maker API —
+    // the same code path used for Hubs #2/#3 — and the row links are rewritten to
+    // relative URLs. Any ID already selected in the picker is dropped here so the
+    // picker and the supplement can never double-count.
     def hub1HealthDevObjs = (hub1HealthDevs ?: []) as List
     def hub1HealthDevIds  = hub1HealthDevObjs.collect { it.id.toString() } as Set
-    def hub1SelectedIds   = normalizeSelectionList(settings["hub1SelectedHealthDevices"])
-    Set hub1SupplementIds = hub1SelectedIds.findAll { !hub1HealthDevIds.contains(it) } as Set
+    def hub1ExtraIds      = (settings["hub1ExtraHealthIds"] ?: "").split(",").collect { it.trim() }.findAll { it }
+    Set hub1SupplementIds = hub1ExtraIds.findAll { !hub1HealthDevIds.contains(it) } as Set
     if (hub1SupplementIds) {
         if (hub1CanToggle) {
             def (supRows, supWarn) = fetchRemoteHealthDeviceStates("127.0.0.1:8080",
